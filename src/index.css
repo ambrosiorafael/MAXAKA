@@ -1,0 +1,50 @@
+:root {
+  --orange: #fd7101;
+  --orange-dark: #c95603;
+  --gold: #fdd202;
+  --ink: #29261f;
+  --display: 'Segoe UI', 'Trebuchet MS', sans-serif;
+  --mono: 'Cascadia Mono', Consolas, monospace;
+  font-family: var(--display);
+  color: var(--ink);
+  background: #fffdf8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  font-optical-sizing: auto;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  scroll-behavior: smooth;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button:focus-visible,
+select:focus-visible {
+  outline: 3px solid rgba(253, 113, 1, 0.45);
+  outline-offset: 3px;
+}
+
+::selection {
+  color: #2c2418;
+  background: #ffe394;
+}

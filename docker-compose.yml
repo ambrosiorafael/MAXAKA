@@ -1,0 +1,103 @@
+services:
+  web:
+    build:
+      context: .
+      target: web
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+
+  server:
+    build:
+      context: .
+      target: server
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-maxaka}
+      MYSQL_USER: ${MYSQL_USER:-maxaka}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Define MYSQL_PASSWORD in .env.production}
+      MYSQL_CONNECTION_LIMIT: ${MYSQL_CONNECTION_LIMIT:-10}
+      MYSQL_QUEUE_LIMIT: ${MYSQL_QUEUE_LIMIT:-100}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Define REDIS_PASSWORD in .env.production}@redis:6379/0
+      INSTANCE_PUBLIC_URL: ${PUBLIC_URL:?Define PUBLIC_URL in .env.production}
+      CLIENT_ORIGIN: ${PUBLIC_URL:?Define PUBLIC_URL in .env.production}
+      HOST_RECONNECT_GRACE_MS: ${HOST_RECONNECT_GRACE_MS:-20000}
+      MEDIA_LISTEN_IP: 0.0.0.0
+      MEDIA_ANNOUNCED_ADDRESS: ${MEDIA_ANNOUNCED_ADDRESS:?Define MEDIA_ANNOUNCED_ADDRESS in .env.production}
+      MEDIA_RTC_MIN_PORT: ${MEDIA_RTC_MIN_PORT:-40000}
+      MEDIA_RTC_MAX_PORT: ${MEDIA_RTC_MAX_PORT:-49999}
+      MEDIA_TURN_URLS: ${MEDIA_TURN_URLS:-}
+      MEDIA_TURN_SHARED_SECRET: ${MEDIA_TURN_SHARED_SECRET:-}
+    expose:
+      - "3001"
+    ports:
+      - "${MEDIA_RTC_MIN_PORT:-40000}-${MEDIA_RTC_MAX_PORT:-49999}:${MEDIA_RTC_MIN_PORT:-40000}-${MEDIA_RTC_MAX_PORT:-49999}/udp"
+      - "${MEDIA_RTC_MIN_PORT:-40000}-${MEDIA_RTC_MAX_PORT:-49999}:${MEDIA_RTC_MIN_PORT:-40000}-${MEDIA_RTC_MAX_PORT:-49999}/tcp"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-maxaka}
+      MYSQL_USER: ${MYSQL_USER:-maxaka}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Define MYSQL_PASSWORD in .env.production}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Define MYSQL_ROOT_PASSWORD in .env.production}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    expose:
+      - "3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Define REDIS_PASSWORD in .env.production}
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL:?Define PUBLIC_URL in .env.production}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+
+volumes:
+  mysql_data:
+  redis_data:
+  caddy_data:
+  caddy_config:
