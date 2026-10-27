@@ -3,7 +3,7 @@ FROM node:22-bookworm-slim AS build
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install --no-install-recommends -y python3 pkg-config build-essential \
+  && apt-get install --no-install-recommends -y python3 python3-invoke pkg-config build-essential \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
@@ -18,7 +18,7 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install --no-install-recommends -y python3 pkg-config build-essential \
+  && apt-get install --no-install-recommends -y python3 python3-invoke pkg-config build-essential \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./

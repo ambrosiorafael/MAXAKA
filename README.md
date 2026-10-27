@@ -37,6 +37,8 @@ npm run dev
 
 O modo online requer MySQL 8.0 ou compatível. Cria primeiro a base de dados:
 
+O `.npmrc` do projeto define Meson 1.6.1 para os scripts Node executados pelo npm. Isto permite que o `mediasoup` compile o worker em ambientes Linux com Python anterior a 3.10, desde que o ambiente também tenha Python 3.7 ou superior, compilador C/C++ e `pkg-config`. A versão pode ser substituída definindo `MESON_VERSION` no ambiente de build. Para áudio e vídeo em produção, confirma que o host permite executar o worker e abrir as portas RTP configuradas.
+
 ```sql
 CREATE DATABASE maxaka CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 ```
