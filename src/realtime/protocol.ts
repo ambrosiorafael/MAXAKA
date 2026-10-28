@@ -69,6 +69,12 @@ export type ChatMessageView = {
   sentAt: string
 }
 
+export type MediaPeerView = {
+  memberId: string
+  memberName: string
+  memberAvatar: string
+}
+
 export type MediaProducerView = {
   producerId: string
   memberId: string
@@ -91,12 +97,28 @@ export type MediaConsumerView = {
   rtpParameters: MediaTypes.RtpParameters
 }
 
+export type MediaSignal =
+  | { type: 'description'; description: { type: 'offer' | 'answer'; sdp: string } }
+  | {
+    type: 'candidate'
+    candidate: {
+      candidate: string
+      sdpMid?: string | null
+      sdpMLineIndex?: number | null
+      usernameFragment?: string | null
+    }
+  }
+
 export type MediaIceServerView = {
   urls: string[]
   username?: string
   credential?: string
   credentialType?: 'password'
 }
+
+export type MediaJoinView =
+  | { peers: MediaPeerView[]; iceServers: MediaIceServerView[] }
+  | { routerRtpCapabilities: MediaTypes.RtpCapabilities; producers: MediaProducerView[]; iceServers: MediaIceServerView[] }
 
 export interface ClientToServerEvents {
   'room:create': (payload: {
@@ -112,7 +134,8 @@ export interface ClientToServerEvents {
   'match:start': (ack: Ack<{ started: true }>) => void
   'match:resolve': (payload: { correct: boolean }, ack: Ack<{ resolved: true }>) => void
   'chat:send': (payload: { text: string }, ack: Ack<{ sent: true }>) => void
-  'media:join': (ack: Ack<{ routerRtpCapabilities: MediaTypes.RtpCapabilities; producers: MediaProducerView[]; iceServers: MediaIceServerView[] }>) => void
+  'media:join': (ack: Ack<MediaJoinView>) => void
+  'media:signal': (payload: { toMemberId: string; signal: MediaSignal }, ack: Ack<{ sent: true }>) => void
   'media:create-transport': (payload: { direction: 'send' | 'receive' }, ack: Ack<MediaTransportView>) => void
   'media:connect-transport': (payload: { transportId: string; dtlsParameters: MediaTypes.DtlsParameters }, ack: Ack<{ connected: true }>) => void
   'media:produce': (payload: { transportId: string; kind: MediaTypes.MediaKind; rtpParameters: MediaTypes.RtpParameters }, ack: Ack<{ id: string }>) => void
@@ -130,6 +153,10 @@ export interface ServerToClientEvents {
   'chat:message': (message: ChatMessageView) => void
   'room:closed': (payload: { message: string }) => void
   'server:error': (message: string) => void
+  'media:peer-joined': (peer: MediaPeerView) => void
+  'media:peer-left': (payload: { memberId: string }) => void
+  'media:signal': (payload: { from: MediaPeerView; signal: MediaSignal }) => void
+  'media:closed': () => void
   'media:producer-added': (producer: MediaProducerView) => void
   'media:producer-closed': (producer: MediaProducerView) => void
 }

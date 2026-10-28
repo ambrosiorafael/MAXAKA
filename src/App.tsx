@@ -24,6 +24,7 @@ import type {
 type Screen = 'home' | 'profile' | 'mode' | 'setup' | 'match' | 'online-room' | 'online-match' | 'help' | 'credits'
 type OnlineAction = 'create' | 'join' | null
 type RealtimeSocket = Socket<ServerToClientEvents, ClientToServerEvents>
+const configuredRealtimeServer = import.meta.env.VITE_SERVER_URL?.trim() || undefined
 const RoomMedia = lazy(() => import('./components/RoomMedia.tsx'))
 
 type Player = {
@@ -171,7 +172,7 @@ function App() {
   function connectRealtime(): RealtimeSocket {
     if (realtimeRef.current) return realtimeRef.current
     const token = sessionStorage.getItem('maxaka.session')
-    const client = io(sessionStorage.getItem('maxaka.server') || undefined, {
+    const client = io(sessionStorage.getItem('maxaka.server') || configuredRealtimeServer, {
       auth: token ? { sessionToken: token } : {},
       reconnection: true,
       reconnectionAttempts: 8,
