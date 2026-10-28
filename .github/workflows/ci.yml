@@ -33,6 +33,8 @@ jobs:
 
       - name: Test
         run: npm test
+        env:
+          MYSQL_PASSWORD: test-password
 
       - name: Build server container
         run: docker build --target server --tag maxaka-server:ci .

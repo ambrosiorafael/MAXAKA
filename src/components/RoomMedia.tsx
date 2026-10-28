@@ -1,34 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Device, type types as MediaTypes } from 'mediasoup-client'
 import type { Socket } from 'socket.io-client'
 import type {
   AckResult,
   ClientToServerEvents,
-  MediaConsumerView,
-  MediaProducerView,
-  MediaTransportView,
+  MediaJoinView,
+  MediaPeerView,
+  MediaSignal,
   ServerToClientEvents,
 } from '../realtime/protocol.ts'
 
 type RealtimeSocket = Socket<ServerToClientEvents, ClientToServerEvents>
-type MediaKind = 'audio' | 'video'
 
-type RemoteParticipant = {
-  memberId: string
-  name: string
-  avatar: string
-  stream: MediaStream
-  hasVideo: boolean
+type PeerConnectionState = {
+  peer: MediaPeerView
+  connection: RTCPeerConnection
+  audioStream: MediaStream
+  audioSender: RTCRtpSender
+  pendingCandidates: RTCIceCandidateInit[]
 }
 
-type MediaResources = {
-  device: Device
-  sendTransport: MediaTypes.Transport
-  receiveTransport: MediaTypes.Transport
-  producers: Map<MediaKind, MediaTypes.Producer>
-  consumers: Map<string, MediaTypes.Consumer>
+type CallResources = {
+  peers: Map<string, PeerConnectionState>
+  iceServers: RTCIceServer[]
   localStream: MediaStream
+  localTrack?: MediaStreamTrack
 }
+
+type ActiveMediaPeer = MediaPeerView & { audioStream: MediaStream }
 
 type RoomMediaProps = {
   socket: RealtimeSocket
@@ -47,308 +45,266 @@ type RoomMediaProps = {
 function request<T>(emit: (ack: (error: Error | null, result: AckResult<T>) => void) => void): Promise<T> {
   return new Promise((resolve, reject) => {
     emit((error, result) => {
-      if (error) {
-        reject(error)
-      } else if (result.ok) {
-        resolve(result.data)
-      } else {
-        reject(new Error(result.error))
-      }
+      if (error) reject(error)
+      else if (result.ok) resolve(result.data)
+      else reject(new Error(result.error))
     })
   })
 }
 
 function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error('O transporte de mídia falhou.')
+  return error instanceof Error ? error : new Error('A ligação de áudio falhou.')
 }
 
-function MediaTile({ participant, local = false }: { participant: RemoteParticipant; local?: boolean }) {
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const [voiceActive, setVoiceActive] = useState(false)
-  const hasAudio = participant.stream.getAudioTracks().length > 0
+function errorMessage(error: unknown): string {
+  const mediaError = toError(error)
+  if (mediaError.name === 'NotAllowedError') return 'A autorização do microfone foi recusada no navegador.'
+  if (mediaError.name === 'NotFoundError') return 'Não foi encontrado um microfone compatível.'
+  if (mediaError.name === 'NotReadableError') return 'O microfone está a ser usado por outra aplicação.'
+  return mediaError.message
+}
 
-  useEffect(() => {
-    const videoElement = videoRef.current
-    if (videoElement) videoElement.srcObject = participant.stream
-    return () => {
-      if (videoElement) videoElement.srcObject = null
-    }
-  }, [participant.stream])
-
-  useEffect(() => {
-    if (local || !hasAudio) return
-    if (!('AudioContext' in window)) return
-
-    const audioContext = new AudioContext()
-    const analyser = audioContext.createAnalyser()
-    analyser.fftSize = 256
-    audioContext.createMediaStreamSource(participant.stream).connect(analyser)
-    const samples = new Uint8Array(analyser.fftSize)
-    let frame = 0
-    let previousVoiceState = false
-    const detectVoice = () => {
-      analyser.getByteTimeDomainData(samples)
-      const power = samples.reduce((sum, sample) => sum + ((sample - 128) / 128) ** 2, 0) / samples.length
-      const active = Math.sqrt(power) > 0.035
-      if (active !== previousVoiceState) {
-        previousVoiceState = active
-        setVoiceActive(active)
-      }
-      frame = window.requestAnimationFrame(detectVoice)
-    }
-    if (audioContext.state === 'suspended') {
-      void audioContext.resume().catch((error: unknown) => console.error('Não foi possível iniciar o indicador de voz:', error))
-    }
-    frame = window.requestAnimationFrame(detectVoice)
-
-    return () => {
-      window.cancelAnimationFrame(frame)
-      void audioContext.close()
-    }
-  }, [hasAudio, local, participant.stream])
-
-  return (
-    <article className={`media-tile ${local ? 'media-tile-local' : ''}`}>
-      <span className="media-tile-avatar" aria-hidden="true">{participant.avatar}</span>
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted={local}
-        className={participant.hasVideo ? 'media-video-visible' : 'media-video-hidden'}
-        aria-label={local ? 'Pré-visualização da tua câmara' : `Vídeo de ${participant.name}`}
-      />
-      {!local && hasAudio && (
-        <span className={`media-voice-indicator ${voiceActive ? 'media-voice-active' : ''}`} aria-live="polite">
-          {voiceActive ? 'A falar' : 'Áudio ligado'}
-        </span>
-      )}
-      <strong>{participant.name}{local ? ' · Tu' : ''}</strong>
-    </article>
-  )
+function closeResources(resources: CallResources): void {
+  for (const peer of resources.peers.values()) peer.connection.close()
+  resources.peers.clear()
+  resources.localStream.getTracks().forEach((track) => track.stop())
 }
 
 export default function RoomMedia({ socket, memberId, avatar, isHost, roomStatus, settings }: RoomMediaProps) {
-  const resourcesRef = useRef<MediaResources | null>(null)
-  const remoteParticipantsRef = useRef(new Map<string, RemoteParticipant>())
-  const knownProducersRef = useRef(new Map<string, MediaProducerView>())
-  const pendingConsumersRef = useRef(new Set<string>())
-  const pendingKindsRef = useRef(new Set<MediaKind>())
+  const resourcesRef = useRef<CallResources | null>(null)
+  const busyRef = useRef(false)
+  const shouldReconnectRef = useRef(false)
   const [callActive, setCallActive] = useState(false)
-  const [localStream, setLocalStream] = useState<MediaStream | null>(null)
-  const [enabledKinds, setEnabledKinds] = useState<Record<MediaKind, boolean>>({ audio: false, video: false })
-  const [pendingKinds, setPendingKinds] = useState<Record<MediaKind, boolean>>({ audio: false, video: false })
-  const [participants, setParticipants] = useState<RemoteParticipant[]>([])
+  const [microphoneEnabled, setMicrophoneEnabled] = useState(false)
+  const [microphonePending, setMicrophonePending] = useState(false)
+  const [participants, setParticipants] = useState<ActiveMediaPeer[]>([])
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
   const [minimized, setMinimized] = useState(false)
-  const busyRef = useRef(false)
-  const shouldReconnectRef = useRef(false)
 
-  function refreshParticipants(): void {
-    setParticipants([...remoteParticipantsRef.current.values()])
-  }
-
-  const removeProducer = useCallback((producerId: string): void => {
-    const participant = remoteParticipantsRef.current.get(knownProducersRef.current.get(producerId)?.memberId ?? '')
-    knownProducersRef.current.delete(producerId)
-    pendingConsumersRef.current.delete(producerId)
-    const consumer = resourcesRef.current?.consumers.get(producerId)
-    if (consumer) {
-      consumer.close()
-      resourcesRef.current?.consumers.delete(producerId)
-    }
-    if (participant && consumer) {
-      participant.stream.removeTrack(consumer.track)
-      participant.hasVideo = participant.stream.getVideoTracks().length > 0
-      if (participant.stream.getTracks().length === 0) remoteParticipantsRef.current.delete(participant.memberId)
-      refreshParticipants()
-    }
+  const refreshParticipants = useCallback((resources: CallResources): void => {
+    setParticipants([...resources.peers.values()].map(({ peer, audioStream }) => ({ ...peer, audioStream })))
   }, [])
 
-  const consumeProducer = useCallback(async (producerInfo: MediaProducerView): Promise<void> => {
-    const resources = resourcesRef.current
-    if (!resources || producerInfo.memberId === memberId || resources.consumers.has(producerInfo.producerId) || pendingConsumersRef.current.has(producerInfo.producerId)) return
-    pendingConsumersRef.current.add(producerInfo.producerId)
-    try {
-      const parameters = await request<MediaConsumerView>((ack) => socket.timeout(8000).emit(
-        'media:consume',
-        { transportId: resources.receiveTransport.id, producerId: producerInfo.producerId, rtpCapabilities: resources.device.recvRtpCapabilities },
-        ack,
-      ))
-      const consumer = await resources.receiveTransport.consume(parameters)
-      resources.consumers.set(producerInfo.producerId, consumer)
-      const participant = remoteParticipantsRef.current.get(producerInfo.memberId) ?? {
-        memberId: producerInfo.memberId,
-        name: producerInfo.memberName,
-        avatar: producerInfo.memberAvatar,
-        stream: new MediaStream(),
-        hasVideo: false,
-      }
-      participant.stream.addTrack(consumer.track)
-      participant.hasVideo = participant.stream.getVideoTracks().length > 0
-      remoteParticipantsRef.current.set(participant.memberId, participant)
-      consumer.on('transportclose', () => removeProducer(producerInfo.producerId))
-      await request<{ resumed: true }>((ack) => socket.timeout(8000).emit('media:resume-consumer', { consumerId: consumer.id }, ack))
-      refreshParticipants()
-    } catch (error) {
-      setNotice(`Não foi possível receber a mídia de ${producerInfo.memberName}: ${toError(error).message}`)
-    } finally {
-      pendingConsumersRef.current.delete(producerInfo.producerId)
+  const sendSignal = useCallback((toMemberId: string, signal: MediaSignal): Promise<{ sent: true }> => (
+    request<{ sent: true }>((ack) => socket.timeout(8000).emit('media:signal', { toMemberId, signal }, ack))
+  ), [socket])
+
+  const createPeerConnection = useCallback((
+    peer: MediaPeerView,
+    resources: CallResources,
+    shouldOffer: boolean,
+  ): PeerConnectionState => {
+    const existing = resources.peers.get(peer.memberId)
+    if (existing) return existing
+
+    const connection = new RTCPeerConnection({ iceServers: resources.iceServers })
+    const audioTransceiver = connection.addTransceiver('audio', { direction: 'sendrecv' })
+    const state: PeerConnectionState = {
+      peer,
+      connection,
+      audioStream: new MediaStream(),
+      audioSender: audioTransceiver.sender,
+      pendingCandidates: [],
     }
-  }, [memberId, removeProducer, socket])
+    resources.peers.set(peer.memberId, state)
+    refreshParticipants(resources)
+
+    connection.ontrack = (event) => {
+      const stream = event.streams[0]
+      if (stream) {
+        state.audioStream = stream
+      } else if (!state.audioStream.getTracks().some((track) => track.id === event.track.id)) {
+        state.audioStream.addTrack(event.track)
+      }
+      refreshParticipants(resources)
+    }
+
+    connection.onicecandidate = (event) => {
+      const candidate = event.candidate?.toJSON()
+      if (!candidate?.candidate) return
+      void sendSignal(peer.memberId, {
+        type: 'candidate',
+        candidate: {
+          candidate: candidate.candidate,
+          ...(candidate.sdpMid === undefined ? {} : { sdpMid: candidate.sdpMid }),
+          ...(candidate.sdpMLineIndex === undefined ? {} : { sdpMLineIndex: candidate.sdpMLineIndex }),
+          ...(candidate.usernameFragment === undefined ? {} : { usernameFragment: candidate.usernameFragment }),
+        },
+      }).catch((error: unknown) => setNotice(`Não foi possível enviar dados de ligação a ${peer.memberName}: ${toError(error).message}`))
+    }
+
+    connection.onconnectionstatechange = () => {
+      if (connection.connectionState === 'failed') {
+        setNotice(`Não foi possível estabelecer áudio com ${peer.memberName}. A rede poderá exigir um servidor TURN.`)
+      }
+    }
+
+    if (resources.localTrack) {
+      void audioTransceiver.sender.replaceTrack(resources.localTrack).catch((error: unknown) => {
+        setNotice(`Não foi possível partilhar o microfone com ${peer.memberName}: ${toError(error).message}`)
+      })
+    }
+
+    if (shouldOffer) {
+      void connection.createOffer()
+        .then((offer) => connection.setLocalDescription(offer))
+        .then(() => {
+          const description = connection.localDescription
+          if (!description?.sdp || (description.type !== 'offer' && description.type !== 'answer')) {
+            throw new Error('O navegador não criou uma oferta de áudio válida.')
+          }
+          return sendSignal(peer.memberId, {
+            type: 'description',
+            description: { type: description.type, sdp: description.sdp },
+          })
+        })
+        .catch((error: unknown) => setNotice(`Não foi possível iniciar áudio com ${peer.memberName}: ${toError(error).message}`))
+    }
+
+    return state
+  }, [refreshParticipants, sendSignal])
+
+  const handleSignal = useCallback(async (from: MediaPeerView, signal: MediaSignal): Promise<void> => {
+    const resources = resourcesRef.current
+    if (!resources) return
+
+    const peer = createPeerConnection(from, resources, memberId < from.memberId)
+    try {
+      if (signal.type === 'candidate') {
+        if (peer.connection.remoteDescription) {
+          await peer.connection.addIceCandidate(signal.candidate)
+        } else {
+          peer.pendingCandidates.push(signal.candidate)
+        }
+        return
+      }
+
+      await peer.connection.setRemoteDescription(signal.description)
+      if (signal.description.type === 'offer') {
+        const answer = await peer.connection.createAnswer()
+        await peer.connection.setLocalDescription(answer)
+        const description = peer.connection.localDescription
+        if (!description?.sdp || description.type !== 'answer') {
+          throw new Error('O navegador não criou uma resposta de áudio válida.')
+        }
+        await sendSignal(from.memberId, {
+          type: 'description',
+          description: { type: description.type, sdp: description.sdp },
+        })
+      }
+
+      for (const candidate of peer.pendingCandidates.splice(0)) {
+        await peer.connection.addIceCandidate(candidate)
+      }
+    } catch (error) {
+      setNotice(`Não foi possível estabelecer áudio com ${from.memberName}: ${toError(error).message}`)
+    }
+  }, [createPeerConnection, memberId, sendSignal])
 
   const initializeCall = useCallback(async (): Promise<void> => {
     if (resourcesRef.current || busyRef.current) return
     busyRef.current = true
     setBusy(true)
     setNotice('')
+    let resources: CallResources | undefined
     try {
-      const mediaRoom = await request<{ routerRtpCapabilities: MediaTypes.RtpCapabilities; producers: MediaProducerView[]; iceServers: RTCIceServer[] }>(
+      if (!('RTCPeerConnection' in window)) throw new Error('Este navegador não suporta chamadas WebRTC.')
+      const call = await request<MediaJoinView>(
         (ack) => socket.timeout(8000).emit('media:join', ack),
       )
-      knownProducersRef.current.clear()
-      for (const producer of mediaRoom.producers) knownProducersRef.current.set(producer.producerId, producer)
-      const device = new Device()
-      await device.load({ routerRtpCapabilities: mediaRoom.routerRtpCapabilities })
-      const sendParameters = await request<MediaTransportView>((ack) => socket.timeout(8000).emit('media:create-transport', { direction: 'send' }, ack))
-      const receiveParameters = await request<MediaTransportView>((ack) => socket.timeout(8000).emit('media:create-transport', { direction: 'receive' }, ack))
-      const sendTransport = device.createSendTransport({ ...sendParameters, iceServers: mediaRoom.iceServers })
-      const receiveTransport = device.createRecvTransport({ ...receiveParameters, iceServers: mediaRoom.iceServers })
-
-      for (const transport of [sendTransport, receiveTransport]) {
-        transport.on('connect', ({ dtlsParameters }, callback, errback) => {
-          void request<{ connected: true }>((ack) => socket.timeout(8000).emit(
-            'media:connect-transport',
-            { transportId: transport.id, dtlsParameters },
-            ack,
-          )).then(callback, (error: unknown) => errback(toError(error)))
-        })
-        transport.on('connectionstatechange', (state) => {
-          if (state === 'failed') setNotice('A ligação de mídia falhou. Sai da chamada e tenta entrar novamente.')
-        })
-      }
-      sendTransport.on('produce', ({ kind, rtpParameters }, callback, errback) => {
-        void request<{ id: string }>((ack) => socket.timeout(8000).emit(
-          'media:produce',
-          { transportId: sendTransport.id, kind, rtpParameters },
-          ack,
-        )).then(callback, (error: unknown) => errback(toError(error)))
-      })
-
-      const resources = {
-        device,
-        sendTransport,
-        receiveTransport,
-        producers: new Map<MediaKind, MediaTypes.Producer>(),
-        consumers: new Map<string, MediaTypes.Consumer>(),
+      if (!('peers' in call)) throw new Error('O servidor está a usar um protocolo de áudio incompatível.')
+      resources = {
+        peers: new Map(),
+        iceServers: call.iceServers,
         localStream: new MediaStream(),
       }
       resourcesRef.current = resources
       shouldReconnectRef.current = true
-      setLocalStream(resources.localStream)
       setCallActive(true)
-      for (const producer of knownProducersRef.current.values()) void consumeProducer(producer)
+      setMicrophoneEnabled(false)
+      for (const peer of call.peers) {
+        createPeerConnection(peer, resources, memberId < peer.memberId)
+      }
     } catch (error) {
+      if (resources) {
+        closeResources(resources)
+        if (resourcesRef.current === resources) resourcesRef.current = null
+      }
+      setParticipants([])
+      setCallActive(false)
       let cleanupMessage = ''
       try {
         await request<{ left: true }>((ack) => socket.timeout(3000).emit('media:leave', ack))
       } catch (cleanupError) {
-        cleanupMessage = ` A limpeza no servidor também falhou: ${toError(cleanupError).message}`
+        cleanupMessage = ` A saída do servidor também falhou: ${toError(cleanupError).message}`
       }
       setNotice(`Não foi possível entrar na chamada: ${toError(error).message}.${cleanupMessage}`)
     } finally {
       busyRef.current = false
       setBusy(false)
     }
-  }, [consumeProducer, socket])
+  }, [createPeerConnection, memberId, socket])
 
-  async function toggleKind(kind: MediaKind): Promise<void> {
+  async function toggleMicrophone(): Promise<void> {
     const resources = resourcesRef.current
-    if (!resources || pendingKindsRef.current.has(kind)) return
+    if (!resources || microphonePending) return
+    setMicrophonePending(true)
+    setNotice('')
 
-    if (enabledKinds[kind]) {
-      const existingProducer = resources.producers.get(kind)
-      if (!existingProducer) return
-      const track = existingProducer.track
-      existingProducer.close()
-      resources.producers.delete(kind)
-      if (track) {
-        resources.localStream.removeTrack(track)
-        track.stop()
-      }
-      setLocalStream(resources.localStream)
-      setEnabledKinds((current) => ({ ...current, [kind]: false }))
+    if (resources.localTrack) {
+      const track = resources.localTrack
       try {
-        await request<{ closed: true }>((ack) => socket.timeout(5000).emit('media:close-producer', { producerId: existingProducer.id }, ack))
+        await Promise.all([...resources.peers.values()].map(({ audioSender }) => audioSender.replaceTrack(null)))
+        resources.localStream.removeTrack(track)
+        resources.localTrack = undefined
+        track.stop()
+        setMicrophoneEnabled(false)
       } catch (error) {
-        setNotice(`A faixa local foi desligada, mas o servidor não confirmou a alteração: ${toError(error).message}`)
+        setNotice(`Não foi possível desligar o microfone em todas as ligações: ${toError(error).message}`)
+      } finally {
+        setMicrophonePending(false)
       }
       return
     }
 
-    pendingKindsRef.current.add(kind)
-    setPendingKinds((current) => ({ ...current, [kind]: true }))
-    setNotice('')
-    let acquiredStream: MediaStream | undefined
-
+    let stream: MediaStream | undefined
     try {
-      const currentResources = resourcesRef.current
-      if (!currentResources) throw new Error('A chamada terminou antes da ativação do dispositivo.')
       if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error('Este navegador não suporta câmara e microfone neste endereço. Usa um dispositivo compatível e HTTPS.')
+        throw new Error('O navegador não disponibiliza o microfone. Usa HTTPS e um navegador compatível.')
       }
-      acquiredStream = await navigator.mediaDevices.getUserMedia({
-        audio: kind === 'audio',
-        video: kind === 'video',
-      })
-      const track = kind === 'audio' ? acquiredStream.getAudioTracks()[0] : acquiredStream.getVideoTracks()[0]
-      if (!track) throw new Error(kind === 'audio' ? 'Não foi encontrada uma faixa de microfone.' : 'Não foi encontrada uma faixa de câmara.')
-      const producer = await currentResources.sendTransport.produce({ track })
-      currentResources.producers.set(kind, producer)
-      currentResources.localStream.addTrack(track)
-      setLocalStream(currentResources.localStream)
-      setEnabledKinds((current) => ({ ...current, [kind]: true }))
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+      const track = stream.getAudioTracks()[0]
+      if (!track) throw new Error('Não foi encontrada uma faixa de microfone.')
+      await Promise.all([...resources.peers.values()].map(({ audioSender }) => audioSender.replaceTrack(track)))
+      resources.localStream.addTrack(track)
+      resources.localTrack = track
+      setMicrophoneEnabled(true)
     } catch (error) {
-      acquiredStream?.getTracks().forEach((track) => track.stop())
-      const mediaError = toError(error)
-      const reason = mediaError.name === 'NotAllowedError'
-        ? 'A autorização foi recusada no navegador.'
-        : mediaError.name === 'NotFoundError'
-          ? 'Não foi encontrado um dispositivo compatível.'
-          : mediaError.message
-      setNotice(`Não foi possível ativar ${kind === 'audio' ? 'o microfone' : 'a câmara'}: ${reason}`)
+      stream?.getTracks().forEach((track) => track.stop())
+      setNotice(`Não foi possível ativar o microfone: ${errorMessage(error)}`)
     } finally {
-      pendingKindsRef.current.delete(kind)
-      setPendingKinds((current) => ({ ...current, [kind]: false }))
+      setMicrophonePending(false)
     }
   }
 
-  async function leaveCall(): Promise<void> {
+  const leaveCall = useCallback(async (message = ''): Promise<void> => {
     shouldReconnectRef.current = false
     const resources = resourcesRef.current
     resourcesRef.current = null
-    resources?.consumers.forEach((consumer) => consumer.close())
-    resources?.producers.forEach((producer) => producer.close())
-    resources?.sendTransport.close()
-    resources?.receiveTransport.close()
-    resources?.localStream.getTracks().forEach((track) => track.stop())
-    remoteParticipantsRef.current.clear()
-    knownProducersRef.current.clear()
-    pendingConsumersRef.current.clear()
+    if (resources) closeResources(resources)
     setParticipants([])
-    setLocalStream(null)
-    setEnabledKinds({ audio: false, video: false })
+    setMicrophoneEnabled(false)
     setCallActive(false)
-    setNotice('')
+    setNotice(message)
     try {
       await request<{ left: true }>((ack) => socket.timeout(3000).emit('media:leave', ack))
     } catch (error) {
       setNotice(`A chamada foi desligada neste dispositivo, mas o servidor não confirmou a saída: ${toError(error).message}`)
     }
-  }
+  }, [socket])
 
-  async function toggleRoomSetting(setting: keyof RoomMediaProps['settings']): Promise<void> {
+  async function toggleRoomSetting(setting: 'audioEnabled' | 'textChatEnabled' | 'mimeEnabled'): Promise<void> {
     try {
       await request<{ room: { mediaSettings: RoomMediaProps['settings'] } }>((ack) => socket.timeout(5000).emit(
         'room:settings',
@@ -362,128 +318,108 @@ export default function RoomMedia({ socket, memberId, avatar, isHost, roomStatus
   }
 
   useEffect(() => {
-    const onProducerAdded = (producer: MediaProducerView) => {
-      knownProducersRef.current.set(producer.producerId, producer)
-      void consumeProducer(producer)
+    const onPeerJoined = (peer: MediaPeerView) => {
+      const resources = resourcesRef.current
+      if (resources) createPeerConnection(peer, resources, memberId < peer.memberId)
     }
-    const onProducerClosed = (producer: MediaProducerView) => {
-      if (producer.memberId === memberId) {
-        const resources = resourcesRef.current
-        const kind = producer.kind
-        const localProducer = resources?.producers.get(kind)
-        if (localProducer?.id === producer.producerId) {
-          const track = localProducer.track
-          localProducer.close()
-          resources?.producers.delete(kind)
-          if (track) {
-            resources?.localStream.removeTrack(track)
-            track.stop()
-          }
-          if (resources) setLocalStream(resources.localStream)
-          setEnabledKinds((current) => ({ ...current, [kind]: false }))
-        }
-      } else {
-        removeProducer(producer.producerId)
-      }
+    const onPeerLeft = ({ memberId: leftMemberId }: { memberId: string }) => {
+      const resources = resourcesRef.current
+      const peer = resources?.peers.get(leftMemberId)
+      if (!resources || !peer) return
+      peer.connection.close()
+      resources.peers.delete(leftMemberId)
+      refreshParticipants(resources)
+    }
+    const onSignal = ({ from, signal }: { from: MediaPeerView; signal: MediaSignal }) => {
+      void handleSignal(from, signal)
+    }
+    const onCallClosed = () => {
+      const resources = resourcesRef.current
+      resourcesRef.current = null
+      if (resources) closeResources(resources)
+      setParticipants([])
+      setMicrophoneEnabled(false)
+      setCallActive(false)
+      setNotice('O anfitrião encerrou a chamada de áudio.')
     }
     const onDisconnect = () => {
       const resources = resourcesRef.current
       shouldReconnectRef.current = Boolean(resources)
       resourcesRef.current = null
-      resources?.consumers.forEach((consumer) => consumer.close())
-      resources?.producers.forEach((producer) => producer.close())
-      resources?.sendTransport.close()
-      resources?.receiveTransport.close()
-      resources?.localStream.getTracks().forEach((track) => track.stop())
-      remoteParticipantsRef.current.clear()
-      knownProducersRef.current.clear()
-      pendingConsumersRef.current.clear()
+      if (resources) closeResources(resources)
       setParticipants([])
-      setLocalStream(null)
-      setEnabledKinds({ audio: false, video: false })
+      setMicrophoneEnabled(false)
       setCallActive(false)
-      setNotice('A ligação à sala foi perdida; a chamada foi desligada.')
+      if (resources) setNotice('A ligação à sala foi perdida; a chamada de áudio foi desligada.')
     }
     const onConnect = () => {
       if (!shouldReconnectRef.current) return
       shouldReconnectRef.current = false
       void initializeCall()
     }
-    socket.on('media:producer-added', onProducerAdded)
-    socket.on('media:producer-closed', onProducerClosed)
+
+    socket.on('media:peer-joined', onPeerJoined)
+    socket.on('media:peer-left', onPeerLeft)
+    socket.on('media:signal', onSignal)
+    socket.on('media:closed', onCallClosed)
     socket.on('disconnect', onDisconnect)
     socket.on('connect', onConnect)
     return () => {
-      socket.off('media:producer-added', onProducerAdded)
-      socket.off('media:producer-closed', onProducerClosed)
+      socket.off('media:peer-joined', onPeerJoined)
+      socket.off('media:peer-left', onPeerLeft)
+      socket.off('media:signal', onSignal)
+      socket.off('media:closed', onCallClosed)
       socket.off('disconnect', onDisconnect)
       socket.off('connect', onConnect)
       const resources = resourcesRef.current
       resourcesRef.current = null
-      resources?.consumers.forEach((consumer) => consumer.close())
-      resources?.producers.forEach((producer) => producer.close())
-      resources?.sendTransport.close()
-      resources?.receiveTransport.close()
-      resources?.localStream.getTracks().forEach((track) => track.stop())
-      if (resources && socket.connected) {
-        void request<{ left: true }>((ack) => socket.timeout(3000).emit('media:leave', ack)).catch((error: unknown) => {
-          console.error('Não foi possível confirmar a saída da chamada:', error)
-        })
+      if (resources) {
+        closeResources(resources)
+        if (socket.connected) {
+          void request<{ left: true }>((ack) => socket.timeout(3000).emit('media:leave', ack)).catch((error: unknown) => {
+            console.error('Não foi possível confirmar a saída da chamada:', error)
+          })
+        }
       }
     }
-  }, [socket, memberId, consumeProducer, initializeCall, removeProducer])
+  }, [createPeerConnection, handleSignal, initializeCall, memberId, refreshParticipants, socket])
 
   useEffect(() => {
-    const resources = resourcesRef.current
-    if (!resources) return
-    for (const kind of ['audio', 'video'] as const) {
-      const enabled = kind === 'audio' ? settings.audioEnabled : settings.videoEnabled
-      const producer = resources.producers.get(kind)
-      if (enabled || !producer) continue
-      const producerId = producer.id
-      producer.close()
-      resources.producers.delete(kind)
-      const track = producer.track
-      if (track) {
-        resources.localStream.removeTrack(track)
-        track.stop()
-      }
-      void request<{ closed: true }>((ack) => socket.timeout(3000).emit('media:close-producer', { producerId }, ack)).catch((error: unknown) => {
-        console.error('Não foi possível confirmar o fim da fonte de mídia:', error)
-      })
-      setEnabledKinds((current) => ({ ...current, [kind]: false }))
-      setLocalStream(resources.localStream)
-    }
-  }, [removeProducer, settings.audioEnabled, settings.videoEnabled, socket])
+    if (settings.audioEnabled || !resourcesRef.current) return
+    void leaveCall('O anfitrião desativou o áudio desta sala.')
+  }, [leaveCall, settings.audioEnabled])
 
   return (
-    <section className="room-media-panel" aria-label="Áudio e vídeo da sala">
+    <section className="room-media-panel" aria-label="Chamada de áudio da sala">
       <div className="room-media-heading">
         <div>
-          <span className="eyebrow">CHAMADA DA SALA</span>
-          <strong>{callActive ? 'Ligado à chamada' : 'Áudio e vídeo opcionais'}</strong>
+          <span className="eyebrow">CHAMADA DA SALA · ÁUDIO</span>
+          <strong>{callActive ? `Na chamada · ${participants.length + 1} participante${participants.length === 0 ? '' : 's'}` : 'Chamada de áudio opcional'}</strong>
         </div>
         {callActive ? (
           <button className="button button-secondary" type="button" onClick={() => void leaveCall()}>Sair da chamada</button>
         ) : (
-          <button className="button button-primary" type="button" disabled={busy || !socket.connected || (!settings.audioEnabled && !settings.videoEnabled)} onClick={() => void initializeCall()}>
+          <button className="button button-primary" type="button" disabled={busy || !socket.connected || !settings.audioEnabled} onClick={() => void initializeCall()}>
             {busy ? 'A ligar…' : 'Entrar na chamada'}
           </button>
         )}
       </div>
       <div className="room-media-policy">
+        <span className={`media-policy-chip ${settings.audioEnabled ? 'media-policy-enabled' : ''}`}>
+          Áudio: {settings.audioEnabled ? 'permitido' : 'desativado'}
+          {isHost && roomStatus === 'open' && (
+            <button type="button" onClick={() => void toggleRoomSetting('audioEnabled')} aria-label="Alterar permissão: Áudio">Alterar</button>
+          )}
+        </span>
+        <span className="media-policy-chip">Vídeo: indisponível nesta versão</span>
         {([
-          ['audioEnabled', 'Áudio'],
-          ['videoEnabled', 'Vídeo'],
           ['textChatEnabled', 'Chat'],
           ['mimeEnabled', 'Mímica'],
         ] as const).map(([setting, label]) => (
           <span className={`media-policy-chip ${settings[setting] ? 'media-policy-enabled' : ''}`} key={setting}>
             {label}: {settings[setting] ? 'permitido' : 'desativado'}
             {isHost && roomStatus === 'open' && (
-              <button type="button" onClick={() => void toggleRoomSetting(setting)} aria-label={`Alterar permissão: ${label}`}>
-                Alterar
-              </button>
+              <button type="button" onClick={() => void toggleRoomSetting(setting)} aria-label={`Alterar permissão: ${label}`}>Alterar</button>
             )}
           </span>
         ))}
@@ -497,30 +433,41 @@ export default function RoomMedia({ socket, memberId, avatar, isHost, roomStatus
           </div>
           {!minimized && (
             <>
-          <div className="room-media-controls">
-            {(['audio', 'video'] as const).map((kind) => (
-              <button
-                className={`media-control ${enabledKinds[kind] ? 'media-control-active' : ''}`}
-                type="button"
-                key={kind}
-                disabled={pendingKinds[kind] || (kind === 'audio' ? !settings.audioEnabled : !settings.videoEnabled)}
-                aria-pressed={enabledKinds[kind]}
-                onClick={() => void toggleKind(kind)}
-              >
-                {pendingKinds[kind] ? 'A ativar…' : enabledKinds[kind] ? (kind === 'audio' ? 'Microfone ligado' : 'Câmara ligada') : (kind === 'audio' ? 'Ligar microfone' : 'Ligar câmara')}
-              </button>
-            ))}
-          </div>
-          <div className="room-media-grid">
-            {localStream && <MediaTile participant={{ memberId, name: 'Tu', avatar, stream: localStream, hasVideo: localStream.getVideoTracks().length > 0 }} local />}
-            {participants.map((participant) => <MediaTile key={participant.memberId} participant={participant} />)}
-            {!localStream && participants.length === 0 && <p className="media-empty">Entra na chamada e liga o microfone ou a câmara quando estiveres pronto.</p>}
-          </div>
+              <div className="room-media-controls">
+                <button
+                  className={`media-control ${microphoneEnabled ? 'media-control-active' : ''}`}
+                  type="button"
+                  disabled={microphonePending || !settings.audioEnabled}
+                  aria-pressed={microphoneEnabled}
+                  onClick={() => void toggleMicrophone()}
+                >
+                  {microphonePending ? 'A ativar…' : microphoneEnabled ? 'Microfone ligado' : 'Ligar microfone'}
+                </button>
+              </div>
+              <div className="room-media-grid">
+                <article className="media-tile media-tile-local">
+                  <span className="media-tile-avatar" aria-hidden="true">{avatar}</span>
+                  <strong>Tu · {microphoneEnabled ? 'microfone ligado' : 'microfone desligado'}</strong>
+                </article>
+                {participants.map((participant) => {
+                  return (
+                    <article className="media-tile" key={participant.memberId}>
+                      <audio autoPlay playsInline ref={(element) => { if (element) element.srcObject = participant.audioStream }} />
+                      <span className="media-tile-avatar" aria-hidden="true">{participant.memberAvatar}</span>
+                      <strong>{participant.memberName}</strong>
+                    </article>
+                  )
+                })}
+                {participants.length === 0 && <p className="media-empty">Ouve a equipa por áudio. Cada participante ativa o próprio microfone quando quiser.</p>}
+              </div>
             </>
           )}
         </>
       )}
-      <p className="media-privacy-note">A câmara e o microfone só são pedidos quando ativares cada controlo. O navegador pode pedir autorização. {settings.mimeEnabled ? 'A mímica está permitida.' : 'A mímica está desativada pelas regras desta sala.'}</p>
+      <p className="media-privacy-note">
+        O microfone só é solicitado quando o ativares. Áudio P2P suporta até 6 pessoas por sala e depende das redes dos participantes; algumas ligações exigem um serviço TURN externo.
+        {settings.mimeEnabled ? ' A mímica está permitida.' : ' A mímica está desativada pelas regras desta sala.'}
+      </p>
       {notice && <p className="notice" role="status">{notice}</p>}
     </section>
   )
