@@ -48,6 +48,8 @@ npm install
 npm run dev
 ```
 
+Para testar salas online no modo local, o proxy do Vite usa `https://api.maxaka.com` por predefinição. Define `VITE_REALTIME_PROXY_TARGET` antes de iniciar o Vite para apontar a outro backend local ou de teste.
+
 ## Executar com salas online
 
 O modo online requer MySQL 8.0 ou compatível. Cria primeiro a base de dados:

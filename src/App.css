@@ -1611,7 +1611,8 @@ button.mode-card:focus-visible {
 }
 
 .active-game-card {
-  min-height: 330px;
+  min-height: 390px;
+  padding: 22px;
 }
 
 .active-game-card .preview-card-word {
@@ -1635,11 +1636,11 @@ button.mode-card:focus-visible {
 }
 
 .game-actions .button {
-  min-height: 41px;
+  min-height: 50px;
   flex: 1;
-  padding: 0 10px;
+  padding: 0 12px;
   gap: 7px;
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .game-actions .button-start-turn {
@@ -1661,8 +1662,8 @@ button.mode-card:focus-visible {
 
 .giver-word-list {
   display: grid;
-  gap: 6px;
-  margin: 4px 0;
+  gap: 9px;
+  margin: 8px 0;
 }
 
 .giver-word {
@@ -1671,7 +1672,7 @@ button.mode-card:focus-visible {
   gap: 9px;
   color: #dfd7c9;
   opacity: 0.65;
-  font-size: 12px;
+  font-size: 15px;
   transition: opacity 150ms ease, color 150ms ease;
 }
 
@@ -1687,10 +1688,10 @@ button.mode-card:focus-visible {
 }
 
 .giver-word > span {
-  width: 18px;
+  width: 24px;
   color: #b7aa93;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .giver-word strong {
@@ -2707,7 +2708,7 @@ button.mode-card:focus-visible {
   }
 
   .active-game-card {
-    min-height: 310px;
+    min-height: 360px;
   }
 
   .winner-banner {

@@ -208,18 +208,22 @@ function App() {
   const activeTeam = match ? currentTeam(match) : undefined
   const activeTurn = match?.turn
   const activeItem = activeTurn?.card.items[activeTurn.itemIndex]
+  const onlinePrivateTurn = onlineMatch && privateTurn
+    && (privateTurn.turnIndex === undefined || privateTurn.turnIndex === onlineMatch.turnIndex)
+    ? privateTurn
+    : null
   const localHintKey = match && activeTurn
     ? `local:${activeTurn.card.id}:${activeTurn.teamId}:${match.teamTurnsPlayed[activeTurn.teamId] ?? 0}:${activeTurn.itemIndex}`
     : ''
-  const onlineHintKey = onlineMatch && privateTurn
-    ? `online:${onlineMatch.turnIndex}:${privateTurn.teamId}:${privateTurn.itemIndex}`
+  const onlineHintKey = onlineMatch && onlinePrivateTurn
+    ? `online:${onlineMatch.turnIndex}:${onlinePrivateTurn.teamId}:${onlinePrivateTurn.itemIndex}`
     : ''
   const onlineTeamCounts = onlineRoom
     ? Array.from({ length: onlineRoom.teamCount }, (_, index) => onlineRoom.members.filter((member) => member.teamId === index + 1).length)
     : []
   const canStartOnline = onlineTeamCounts.length > 1 && onlineTeamCounts.every((count) => count >= 2 && count <= 6)
   const onlineWinner = onlineMatch?.teams.find((team) => team.id === onlineMatch.winnerTeamId)
-  const onlineStarterName = onlineRoom?.members.find((member) => member.id === privateTurn?.starterId)?.name
+  const onlineStarterName = onlineRoom?.members.find((member) => member.id === onlineMatch?.starterId)?.name
   const localWinner = match?.winnerTeamId !== null ? match?.teams.find((team) => team.id === match.winnerTeamId) : null
   const onlineWinnerInProgress = onlineMatch?.winnerTeamId !== null && onlineMatch?.teams.some((team) => team.position < onlineMatch.boardLength)
   const localWinnerInProgress = match?.winnerTeamId !== null && match?.teams.some((team) => team.position < match.boardLength)
@@ -288,7 +292,11 @@ function App() {
     })
     client.on('match:state', (matchState) => {
       setOnlineMatch(matchState)
-      setPrivateTurn((current) => current?.teamId === matchState.currentTeamId ? current : null)
+      setPrivateTurn((current) => current && (
+        current.turnIndex === undefined
+          ? current.teamId === matchState.currentTeamId
+          : current.turnIndex === matchState.turnIndex
+      ) ? current : null)
       if (matchState.status === 'playing' || matchState.status === 'finished') setScreen('online-match')
     })
     client.on('turn:private', setPrivateTurn)
@@ -1138,24 +1146,27 @@ function App() {
                 <div className="turn-banner">
                   <span className={`team-token team-token-${onlineMatch.teams.find((team) => team.id === onlineMatch.currentTeamId)?.color ?? 'orange'}`}>{onlineMatch.currentTeamId}</span>
                   <div><small>VEZ DA</small><strong>{onlineMatch.currentTeamName}</strong></div>
-                  <span className="turn-role">{onlineMatch.turnStatus === 'waiting' ? `Aguarda START${onlineStarterName ? ` de ${onlineStarterName}` : ''}` : privateTurn?.teamId === onlineMatch.currentTeamId ? privateTurn.role === 'human-guesses' ? onlineRoom.hintsEnabled ? 'Adivinha com pistas opcionais' : 'Adivinha sem pistas' : privateTurn.role === 'human-gives' ? 'Dá pistas à equipa' : privateTurn.role === 'watching' ? 'À espera de quem dá as pistas' : 'Os bots estão a jogar' : 'A outra equipa está a jogar'}</span>
-                  <span className="turn-card-count">CARTA {Math.min(5, (privateTurn?.itemIndex ?? 0) + 1)} / 5</span>
+                  <span className="turn-role">{onlineMatch.turnStatus === 'waiting' ? `Aguarda START${onlineStarterName ? ` de ${onlineStarterName}` : ''}` : onlinePrivateTurn?.teamId === onlineMatch.currentTeamId ? onlinePrivateTurn.role === 'human-guesses' ? onlineRoom.hintsEnabled ? 'Adivinha com pistas opcionais' : 'Adivinha sem pistas' : onlinePrivateTurn.role === 'human-gives' ? 'Dá pistas à equipa' : onlinePrivateTurn.role === 'watching' ? 'À espera de quem dá as pistas' : 'Os bots estão a jogar' : 'A outra equipa está a jogar'}</span>
+                  <span className="turn-card-count">CARTA {Math.min(5, (onlinePrivateTurn?.itemIndex ?? 0) + 1)} / 5</span>
                 </div>
                 <div className="match-layout">
                   <div className="preview-card active-game-card">
-                    <div className="preview-card-top"><span>{privateTurn?.category.toLocaleUpperCase('pt-PT') ?? 'RONDA'}</span><span>{Math.min(5, (privateTurn?.itemIndex ?? 0) + 1)} / 5</span></div>
-                    {onlineMatch.turnStatus === 'waiting' && privateTurn?.items ? (
-                      <><div className="giver-word-list">{privateTurn.items.map((item, index) => <div className="giver-word" key={`${privateTurn.category}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span><strong>{item.word}</strong></div>)}</div><p>Cartas visíveis para acompanhar a jogada. Aguarda o início do cronómetro.</p></>
+                    <div className="preview-card-top"><span>{onlinePrivateTurn?.category.toLocaleUpperCase('pt-PT') ?? 'RONDA'}</span><span>{Math.min(5, (onlinePrivateTurn?.itemIndex ?? 0) + 1)} / 5</span></div>
+                    {onlineMatch.turnStatus === 'waiting' && onlinePrivateTurn?.items ? (
+                      <><div className="giver-word-list">{onlinePrivateTurn.items.map((item, index) => <div className="giver-word" key={`${onlinePrivateTurn.category}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span><strong>{item.word}</strong></div>)}</div><p>Cartas visíveis para acompanhar a jogada. Aguarda o início do cronómetro.</p></>
                     ) : onlineMatch.turnStatus === 'waiting' ? (
                       <div className="online-waiting-card">A jogada está preparada.<br /><span>{onlineStarterName ? `${onlineStarterName} inicia quando estiver pronto.` : 'Aguarda o jogador responsável pelo START.'}</span></div>
-                    ) : privateTurn?.teamId !== onlineMatch.currentTeamId || !privateTurn ? (
-                      privateTurn?.items ? (
-                        <><div className="giver-word-list">{privateTurn.items.map((item, index) => <div className={`giver-word ${index === privateTurn.itemIndex ? 'giver-word-current' : index < privateTurn.itemIndex ? 'giver-word-done' : ''}`} key={`${privateTurn.category}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span><strong>{item.word}</strong></div>)}</div><p>Acompanha a carta da equipa em jogo.</p></>
+                    ) : onlinePrivateTurn?.teamId !== onlineMatch.currentTeamId || !onlinePrivateTurn ? (
+                      onlinePrivateTurn?.items ? (
+                        <><div className="giver-word-list">{onlinePrivateTurn.items.map((item, index) => {
+                        const result = onlinePrivateTurn.results?.[index] ?? 'pending'
+                        return <div className={`giver-word ${index === onlinePrivateTurn.itemIndex ? 'giver-word-current' : ''} ${result === 'correct' || result === 'skipped' ? 'giver-word-done' : ''}`} key={`${onlinePrivateTurn.category}-${index}`}><span>{result === 'correct' ? '✓' : result === 'skipped' ? '↷' : String(index + 1).padStart(2, '0')}</span><strong>{item.word}</strong></div>
+                        })}</div><p>Acompanha a carta da equipa em jogo.</p></>
                       ) : <div className="online-waiting-card">A equipa está a jogar.<br /><span>Prepara-te para a próxima ronda.</span></div>
-                    ) : privateTurn.role === 'human-guesses' ? (
+                    ) : onlinePrivateTurn.role === 'human-guesses' ? (
                       <>
                         {onlineRoom.hintsEnabled ? shownHintKey === onlineHintKey ? (
-                          <div className="preview-card-word hint-word">{privateTurn.item?.hint}</div>
+                        <div className="preview-card-word hint-word">{onlinePrivateTurn.item?.hint}</div>
                         ) : (
                           <button className="button button-secondary reveal-hint-button" type="button" onClick={() => setShownHintKey(onlineHintKey)}>
                             Ver pista <span aria-hidden="true">💡</span>
@@ -1165,22 +1176,25 @@ function App() {
                         )}
                         <p>{onlineRoom.hintsEnabled ? 'O colega dá a pista. Confirma o acerto ou passa.' : 'Adivinha o item sem pistas. Confirma o acerto ou passa.'}</p>
                       </>
-                    ) : privateTurn.role === 'human-gives' ? (
-                      <><div className="giver-word-list">{privateTurn.items?.map((item, index) => <div className={`giver-word ${index === privateTurn.itemIndex ? 'giver-word-current' : index < privateTurn.itemIndex ? 'giver-word-done' : ''}`} key={`${privateTurn.category}-${index}`}><span>{index < privateTurn.itemIndex ? '✓' : String(index + 1).padStart(2, '0')}</span><strong>{item.word}</strong></div>)}</div><p>Esta carta só é visível para ti. Dá pistas e confirma cada acerto.</p></>
-                    ) : privateTurn.role === 'watching' ? (
+                    ) : onlinePrivateTurn.role === 'human-gives' ? (
+                      <><div className="giver-word-list">{onlinePrivateTurn.items?.map((item, index) => {
+                        const result = onlinePrivateTurn.results?.[index] ?? 'pending'
+                        return <div className={`giver-word ${index === onlinePrivateTurn.itemIndex ? 'giver-word-current' : ''} ${result === 'correct' || result === 'skipped' ? 'giver-word-done' : ''}`} key={`${onlinePrivateTurn.category}-${index}`}><span>{result === 'correct' ? '✓' : result === 'skipped' ? '↷' : String(index + 1).padStart(2, '0')}</span><strong>{item.word}</strong></div>
+                      })}</div><p>Esta carta só é visível para ti. Dá pistas e confirma cada acerto.</p></>
+                    ) : onlinePrivateTurn.role === 'watching' ? (
                       <div className="online-waiting-card">O colega está a dar pistas.<br /><span>A equipa adversária vê os conteúdos para fiscalizar.</span></div>
                     ) : <div className="online-waiting-card">Os bots estão a jogar esta ronda…</div>}
-                    {onlineMatch.turnStatus === 'waiting' && privateTurn?.canStart && (
+                    {onlineMatch.turnStatus === 'waiting' && onlineMatch.starterId === myOnlineMemberId && (
                       <div className="game-actions">
                         <button className="button button-primary button-start-turn" type="button" disabled={turnStarting} onClick={startOnlineTurn}>
                           {turnStarting ? 'A INICIAR…' : 'START — INICIAR JOGADA'} <span aria-hidden="true">→</span>
                         </button>
                       </div>
                     )}
-                    {onlineMatch.turnStatus === 'active' && privateTurn?.teamId === onlineMatch.currentTeamId && (privateTurn.role === 'human-gives' || privateTurn.role === 'human-guesses') && (
+                    {onlineMatch.turnStatus === 'active' && onlinePrivateTurn?.teamId === onlineMatch.currentTeamId && (onlinePrivateTurn.role === 'human-gives' || onlinePrivateTurn.role === 'human-guesses') && (
                       <div className="game-actions">
                         <button className="button button-secondary skip-button" type="button" onClick={() => resolveOnlineItem(false)}>Passar <span aria-hidden="true">↷</span></button>
-                        <button className="button button-primary" type="button" onClick={() => resolveOnlineItem(true)}>{privateTurn.role === 'human-gives' ? 'A equipa acertou' : 'Acertámos!'} <span aria-hidden="true">✓</span></button>
+                        <button className="button button-primary" type="button" onClick={() => resolveOnlineItem(true)}>{onlinePrivateTurn.role === 'human-gives' ? 'A equipa acertou' : 'Acertámos!'} <span aria-hidden="true">✓</span></button>
                       </div>
                     )}
                     {notice && <p className="online-error" role="status">{notice}</p>}

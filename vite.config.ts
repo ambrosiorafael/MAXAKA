@@ -1,7 +1,7 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
-const realtimeProxyTarget = process.env.VITE_REALTIME_PROXY_TARGET ?? 'http://127.0.0.1:3001'
+const realtimeProxyTarget = process.env.VITE_REALTIME_PROXY_TARGET ?? 'https://api.maxaka.com'
 
 // https://vite.dev/config/
 export default defineConfig({

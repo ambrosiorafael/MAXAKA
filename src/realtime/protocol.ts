@@ -60,8 +60,10 @@ export type MatchStateView = {
 
 export type PrivateTurnView = {
   teamId: number
+  turnIndex?: number
   role: 'human-gives' | 'human-guesses' | 'watching' | 'automated'
   itemIndex: number
+  results?: Array<'pending' | 'correct' | 'skipped'>
   category: string
   starterId: string | null
   canStart: boolean

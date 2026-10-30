@@ -395,7 +395,9 @@ function broadcastPrivateTurn(room: OnlineRoom, emit = true): void {
     const isActiveTeam = member.teamId === team.id
     const common = {
       teamId: team.id,
+      turnIndex: room.turnNumber,
       itemIndex: turn.itemIndex,
+      results: [...turn.results],
       category: turn.card.category,
       starterId: room.starterMemberId ?? null,
       canStart: match.turnStatus === 'waiting' && member.id === room.starterMemberId,
