@@ -26,7 +26,8 @@ import type {
 type Screen = 'home' | 'profile' | 'mode' | 'setup' | 'match' | 'online-room' | 'online-match' | 'help' | 'credits' | 'support' | 'helpdesk'
 type OnlineAction = 'create' | 'join' | null
 type RealtimeSocket = Socket<ServerToClientEvents, ClientToServerEvents>
-const configuredRealtimeServer = import.meta.env.VITE_SERVER_URL?.trim() || undefined
+const configuredRealtimeServer = import.meta.env.VITE_SERVER_URL?.trim()
+  || (import.meta.env.PROD ? 'https://api.maxaka.com' : undefined)
 const RoomMedia = lazy(() => import('./components/RoomMedia.tsx'))
 const supportCategories = [
   'Conta e autenticação',
@@ -268,7 +269,10 @@ function App() {
     setRealtime(null)
 
     const token = sessionStorage.getItem('maxaka.session')
-    const client = io(sessionStorage.getItem('maxaka.server') || configuredRealtimeServer, {
+    const serverUrl = import.meta.env.DEV
+      ? configuredRealtimeServer
+      : sessionStorage.getItem('maxaka.server') || configuredRealtimeServer
+    const client = io(serverUrl, {
       auth: token ? { sessionToken: token } : {},
       reconnection: true,
       reconnectionDelay: 800,

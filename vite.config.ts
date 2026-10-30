@@ -13,6 +13,13 @@ export default defineConfig({
         target: realtimeProxyTarget,
         changeOrigin: true,
         ws: true,
+        configure: (proxy) => {
+          const setAllowedOrigin = (request: { setHeader: (name: string, value: string) => void }) => {
+            request.setHeader('origin', 'https://maxaka.com')
+          }
+          proxy.on('proxyReq', setAllowedOrigin)
+          proxy.on('proxyReqWs', setAllowedOrigin)
+        },
       },
     },
   },
