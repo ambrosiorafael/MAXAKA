@@ -2,7 +2,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import type { RowDataPacket } from 'mysql2'
 import mysql from 'mysql2/promise'
-import { localCards, type GameCard } from '../src/game/catalog.ts'
+import { canonicalGameContentName, gameContentAliases, localCards, normalizeGameContentName, validateCatalog, type GameCard } from '../src/game/catalog.ts'
 import { config } from './config.ts'
 
 export const database = mysql.createPool({
@@ -21,6 +21,8 @@ type CardRow = RowDataPacket & {
   card_id: string
   category: string
   item_order: number
+  content_id: string | null
+  item_category: string
   word: string
   hint: string
 }
@@ -68,34 +70,92 @@ async function applyMigrations(): Promise<void> {
 }
 
 async function seedCards(): Promise<void> {
-  for (const card of localCards) {
+  const activeCardIds = new Set(localCards.map((card) => card.id))
+  const [publishedCards] = await database.execute<Array<RowDataPacket & { id: string }>>(
+    "SELECT id FROM cards WHERE status = 'published'",
+  )
+  const obsoleteCardIds = publishedCards.map(({ id }) => id).filter((id) => !activeCardIds.has(id))
+  const batchSize = 1000
+  for (let offset = 0; offset < obsoleteCardIds.length; offset += batchSize) {
+    const batch = obsoleteCardIds.slice(offset, offset + batchSize)
+    await database.execute(
+      `UPDATE cards SET status = 'archived' WHERE id IN (${batch.map(() => '?').join(',')})`,
+      batch,
+    )
+  }
+
+  const contentItems = [...new Map(localCards.flatMap((card) => card.items.map((item) => [item.id, item] as const))).values()]
+  for (let offset = 0; offset < contentItems.length; offset += batchSize) {
+    const batch = contentItems.slice(offset, offset + batchSize)
+    await database.execute(
+      `INSERT INTO content_catalog (id, normalized_text, canonical_text)
+       VALUES ${batch.map(() => '(?, ?, ?)').join(',')}
+       ON DUPLICATE KEY UPDATE canonical_text = VALUES(canonical_text)`,
+      batch.flatMap((item) => [item.id, canonicalGameContentName(item.word), item.word]),
+    )
+  }
+  for (const { alias, canonicalId } of gameContentAliases) {
+    await database.execute(
+      `INSERT INTO content_aliases (normalized_alias, content_id)
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE content_id = VALUES(content_id)`,
+      [normalizeGameContentName(alias), canonicalId],
+    )
+  }
+
+  const categoryNames = [...new Set(localCards.flatMap((card) => [
+    card.category,
+    ...card.items.map((item) => item.category),
+  ]))]
+  const categoryIds = new Map<string, number>()
+
+  for (const categoryName of categoryNames) {
     await database.execute(
       `INSERT INTO categories (name, language_code)
        VALUES (?, 'pt-MZ')
        ON DUPLICATE KEY UPDATE name = VALUES(name)`,
-      [card.category],
+      [categoryName],
     )
     const [categoryRows] = await database.execute<RowDataPacket[]>(
       'SELECT id FROM categories WHERE name = ? AND language_code = ?',
-      [card.category, 'pt-MZ'],
+      [categoryName, 'pt-MZ'],
     )
-    const categoryId = categoryRows[0]?.id
-    if (!categoryId) throw new Error(`Não foi possível guardar a categoria "${card.category}".`)
+    const categoryId = categoryRows[0]?.id as number | undefined
+    if (!categoryId) throw new Error(`Não foi possível guardar a categoria "${categoryName}".`)
+    categoryIds.set(categoryName, categoryId)
+  }
 
+  const cards = localCards.map((card) => {
+    const categoryId = categoryIds.get(card.category)
+    if (!categoryId) throw new Error(`A categoria "${card.category}" não tem registo de base de dados.`)
+    return [card.id, categoryId, 'pt-MZ', 'published'] as const
+  })
+  for (let offset = 0; offset < cards.length; offset += batchSize) {
+    const batch = cards.slice(offset, offset + batchSize)
     await database.execute(
       `INSERT INTO cards (id, category_id, language_code, status)
-       VALUES (?, ?, 'pt-MZ', 'published')
-       ON DUPLICATE KEY UPDATE category_id = VALUES(category_id), status = 'published'`,
-      [card.id, categoryId],
+       VALUES ${batch.map(() => '(?, ?, ?, ?)').join(',')}
+       ON DUPLICATE KEY UPDATE category_id = VALUES(category_id), status = VALUES(status)`,
+      batch.flat(),
     )
-    for (const [index, item] of card.items.entries()) {
-      await database.execute(
-        `INSERT INTO card_items (card_id, item_order, text, hint)
-         VALUES (?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE text = VALUES(text), hint = VALUES(hint)`,
-        [card.id, index, item.word, item.hint],
-      )
-    }
+  }
+
+  const cardItems = localCards.flatMap((card) => card.items.map((item, index) => [
+    card.id,
+    index,
+    item.category,
+    item.word,
+    item.hint,
+    item.id,
+  ]))
+  for (let offset = 0; offset < cardItems.length; offset += batchSize) {
+    const batch = cardItems.slice(offset, offset + batchSize)
+    await database.execute(
+      `INSERT INTO card_items (card_id, item_order, category, text, hint, content_id)
+       VALUES ${batch.map(() => '(?, ?, ?, ?, ?, ?)').join(',')}
+       ON DUPLICATE KEY UPDATE category = VALUES(category), text = VALUES(text), hint = VALUES(hint), content_id = VALUES(content_id)`,
+      batch.flat(),
+    )
   }
 }
 
@@ -108,18 +168,20 @@ export async function initializeDatabase(): Promise<void> {
 export async function loadPublishedCards(): Promise<GameCard[]> {
   const [rows] = await database.execute<CardRow[]>(
     `SELECT cards.id AS card_id, categories.name AS category,
-            card_items.item_order, card_items.text AS word, card_items.hint
+            card_items.item_order, card_items.content_id, card_items.category AS item_category,
+            card_items.text AS word, card_items.hint
        FROM cards
        JOIN categories ON categories.id = cards.category_id
        JOIN card_items ON card_items.card_id = cards.id
-      WHERE cards.status = 'published'
+      WHERE cards.status = 'published' AND card_items.content_id IS NOT NULL
       ORDER BY cards.id, card_items.item_order`,
   )
-  const cards = new Map<string, { category: string; items: Array<{ word: string; hint: string }> }>()
+  const cards = new Map<string, { category: string; items: Array<{ id: string; word: string; hint: string; category: string }> }>()
 
   for (const row of rows) {
     const card = cards.get(row.card_id) ?? { category: row.category, items: [] }
-    card.items.push({ word: row.word, hint: row.hint })
+    if (!row.content_id) throw new Error(`O item "${row.word}" da carta "${row.card_id}" não tem identificador de conteúdo.`)
+    card.items.push({ id: row.content_id, word: row.word, hint: row.hint, category: row.item_category })
     cards.set(row.card_id, card)
   }
 
@@ -129,6 +191,7 @@ export async function loadPublishedCards(): Promise<GameCard[]> {
     result.push({ id, category: data.category, items: data.items as GameCard['items'] })
   }
   if (result.length === 0) throw new Error('A base de dados não tem cartas publicadas.')
+  validateCatalog(result)
   return result
 }
 

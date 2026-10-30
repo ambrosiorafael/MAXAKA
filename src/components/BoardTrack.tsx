@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 export type BoardTeam = {
   id: number
@@ -22,6 +22,7 @@ type BoardTrackProps = {
 export default function BoardTrack({ teams, boardLength, activeTeamId }: BoardTrackProps) {
   const targetSignature = teams.map((team) => `${team.id}:${team.position}`).join(',')
   const [visualPositions, setVisualPositions] = useState(() => new Map(teams.map((team) => [team.id, team.position])))
+  const visualPositionsRef = useRef(visualPositions)
   const targets = useMemo(
     () => new Map<number, number>(
       targetSignature.split(',').filter(Boolean).map((entry) => {
@@ -37,24 +38,29 @@ export default function BoardTrack({ teams, boardLength, activeTeamId }: BoardTr
     const teamIds = [...targets.keys()]
 
     const step = () => {
-      setVisualPositions((current) => {
-        let hasMovement = false
-        const next = new Map<number, number>()
+      const current = visualPositionsRef.current
+      let hasMovement = false
+      const next = new Map<number, number>()
 
-        for (const teamId of teamIds) {
-          const position = current.get(teamId) ?? 0
-          const target = targets.get(teamId) ?? position
-          if (position !== target) hasMovement = true
-          next.set(teamId, position === target ? position : position + Math.sign(target - position))
-        }
+      for (const teamId of teamIds) {
+        const position = current.get(teamId) ?? 0
+        const target = targets.get(teamId) ?? position
+        if (position !== target) hasMovement = true
+        next.set(teamId, position === target ? position : position + Math.sign(target - position))
+      }
 
-        if (hasMovement) timer = window.setTimeout(step, 130)
-        return hasMovement ? next : current
-      })
+      if (!hasMovement) return
+      visualPositionsRef.current = next
+      setVisualPositions(next)
+      timer = window.setTimeout(step, 130)
     }
 
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-      timer = window.setTimeout(() => setVisualPositions(targets), 0)
+      timer = window.setTimeout(() => {
+        const next = new Map(targets)
+        visualPositionsRef.current = next
+        setVisualPositions(next)
+      }, 0)
     } else {
       timer = window.setTimeout(step, 130)
     }

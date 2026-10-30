@@ -8,6 +8,7 @@
     "rootDir": ".",
     "outDir": "server-dist",
     "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
     "rewriteRelativeImportExtensions": true,
     "verbatimModuleSyntax": true,
     "strict": true,

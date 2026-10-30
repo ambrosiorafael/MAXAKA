@@ -3,9 +3,12 @@ import { describe, it } from 'node:test'
 import { localCards } from './catalog.ts'
 import {
   endAutomatedTurn,
+  replaceCurrentTurnCard,
   resolveCurrentItem,
+  startCurrentTurn,
   startMatch,
   tickMatch,
+  DEFAULT_BOARD_LENGTH,
   TURN_SECONDS,
 } from './engine.ts'
 
@@ -30,21 +33,150 @@ const mixedTeams = [
   },
 ]
 
-const firstTeamStarts = () => startMatch(mixedTeams, localCards, { random: () => 0.5 })
+const firstTeamStarts = () => startCurrentTurn(startMatch(mixedTeams, localCards, { random: () => 0.5 }))
 
 describe('MAXAKA local match engine', () => {
   it('starts a shuffled match with a 30-second turn and five card items', () => {
-    const match = firstTeamStarts()
+    const waiting = startMatch(mixedTeams, localCards, { random: () => 0.5 })
 
+    assert.equal(waiting.status, 'playing')
+    assert.equal(waiting.turnStatus, 'waiting')
+    assert.equal(waiting.secondsLeft, TURN_SECONDS)
+    assert.equal(waiting.boardLength, 30)
+    assert.equal(waiting.turn?.results.length, 5)
+    assert.equal(waiting.turn?.teamId, 2)
+    assert.equal(waiting.turn?.role, 'automated')
+    assert.equal(tickMatch(waiting), waiting)
+    assert.equal(resolveCurrentItem(waiting, true), waiting)
+    const active = startCurrentTurn(waiting)
+    assert.equal(active.turnStatus, 'active')
+    const humanTurn = startCurrentTurn(startMatch(mixedTeams, localCards, { random: () => 0.4 }))
+    assert.equal(humanTurn.turn?.role, 'human-guesses')
+    assert.equal(tickMatch(humanTurn).secondsLeft, TURN_SECONDS - 1)
+  })
+
+  it('uses the 30-space finish line by default for local matches', () => {
+    assert.equal(DEFAULT_BOARD_LENGTH, 30)
+    assert.equal(firstTeamStarts().boardLength, 30)
+  })
+
+  it('gives each team a distinct card and stops only after the whole deck is exhausted', () => {
+    const humanTeams = mixedTeams.map((team) => ({
+      ...team,
+      members: team.members.map((member) => ({ ...member, isBot: false })),
+    }))
+    let match = startCurrentTurn(startMatch(humanTeams, localCards, { random: () => 0 }))
+    const deckCardCount = match.deck.length
+    assert.ok(deckCardCount > 1)
+    const usedCards = new Set<string>()
+    const usedCombinations = new Set<string>()
+    const cardsByTeam = new Map<number, Set<string>>()
+    const usedItems = new Set<string>()
+
+    for (let turn = 0; turn < deckCardCount; turn += 1) {
+      const cardId = match.turn?.card.id
+      assert.ok(cardId)
+      assert.equal(usedCards.has(cardId), false)
+      usedCards.add(cardId)
+      const card = match.turn!.card
+      const combination = card.items.map((item) => item.id).sort().join('|')
+      assert.equal(usedCombinations.has(combination), false)
+      usedCombinations.add(combination)
+      const teamId = match.turn!.teamId
+      for (const [otherTeamId, teamCards] of cardsByTeam) {
+        if (otherTeamId !== teamId) assert.equal(teamCards.has(cardId), false)
+      }
+      const teamCards = cardsByTeam.get(teamId) ?? new Set<string>()
+      teamCards.add(cardId)
+      cardsByTeam.set(teamId, teamCards)
+      for (const item of match.turn!.card.items) {
+        assert.equal(usedItems.has(item.id), false)
+        usedItems.add(item.id)
+      }
+
+      for (let item = 0; item < 5; item += 1) {
+        match = resolveCurrentItem(match, false, () => 0)
+      }
+      if (turn < deckCardCount - 1) {
+        assert.equal(match.status, 'playing')
+        match = startCurrentTurn(match)
+      }
+    }
+
+    assert.equal(usedCards.size, deckCardCount)
+    assert.equal(usedCombinations.size, deckCardCount)
+    assert.equal(usedItems.size, deckCardCount * 5)
+    assert.equal(match.status, 'finished')
+    assert.equal(match.endReason, 'cards-exhausted')
+    assert.equal(match.turn, null)
+    assert.equal(startCurrentTurn(match), match)
+  })
+
+  it('randomizes card order independently for each match', () => {
+    const firstMatch = startMatch(mixedTeams, localCards, { random: () => 0 })
+    const secondMatch = startMatch(mixedTeams, localCards, { random: () => 0.5 })
+
+    assert.notEqual(firstMatch.turn?.card.id, secondMatch.turn?.card.id)
+    assert.equal(new Set(secondMatch.deck.map((card) => card.id)).size, secondMatch.deck.length)
+    const usedContentIds = new Set(secondMatch.deck.flatMap((card) => card.items.map((item) => item.id)))
+    assert.equal(usedContentIds.size, secondMatch.deck.length * 5)
+  })
+
+  it('keeps every unique card in an online deck even when words appear on different cards', () => {
+    const cards = localCards.slice(0, 100)
+    const match = startMatch(mixedTeams, cards, { random: () => 0.4, allowRepeatedItems: true })
+
+    assert.equal(match.deck.length, cards.length)
+    assert.equal(new Set(match.deck.map((card) => card.id)).size, cards.length)
+    assert.ok(new Set(match.deck.flatMap((card) => card.items.map((item) => item.id))).size < cards.length * 5)
+  })
+
+  it('excludes content already used in earlier local matches', () => {
+    const usedContentIds = new Set(localCards[0]!.items.map((item) => item.id))
+    const match = startMatch(mixedTeams, localCards, { random: () => 0, usedContentIds })
+
+    assert.ok(match.deck.every((card) => card.items.every((item) => !usedContentIds.has(item.id))))
+  })
+
+  it('falls back to a shuffled deck when no card can avoid repeated content', () => {
+    const usedContentIds = new Set(localCards.slice(0, 3).flatMap((card) => card.items.map((item) => item.id)))
+    const fullDeck = localCards.slice(0, 3)
+    const match = startMatch(mixedTeams, fullDeck, { random: () => 0, usedContentIds })
+
+    assert.equal(match.deck.length, fullDeck.length)
     assert.equal(match.status, 'playing')
-    assert.equal(match.secondsLeft, TURN_SECONDS)
-    assert.equal(match.turn?.results.length, 5)
-    assert.equal(match.turn?.teamId, 2)
-    assert.equal(match.turn?.role, 'automated')
+  })
+
+  it('advances the deck cursor when another online match reserved the pending card', () => {
+    const deck = localCards.slice(0, 5)
+    let match = startCurrentTurn(startMatch(mixedTeams, deck, { random: () => 0 }))
+    for (let item = 0; item < 5; item += 1) match = resolveCurrentItem(match, false)
+
+    const pendingCard = match.turn?.card
+    const replacementCard = match.deck[3]
+    assert.ok(pendingCard)
+    assert.ok(replacementCard)
+    const replaced = replaceCurrentTurnCard(match, replacementCard)
+    assert.equal(replaced.turn?.card.id, replacementCard.id)
+    assert.equal(replaced.nextCardIndex, 4)
+
+    let nextTurn = startCurrentTurn(replaced)
+    for (let item = 0; item < 5; item += 1) nextTurn = resolveCurrentItem(nextTurn, false)
+    assert.equal(nextTurn.turn?.card.id, deck[4]?.id)
+    assert.notEqual(nextTurn.turn?.card.id, pendingCard.id)
+  })
+
+  it('does not recycle a single card when a campaign has only one card', () => {
+    let match = startCurrentTurn(startMatch(mixedTeams, [localCards[0]!], { random: () => 0 }))
+    for (let item = 0; item < 5; item += 1) match = resolveCurrentItem(match, false)
+
+    assert.equal(match.status, 'finished')
+    assert.equal(match.endReason, 'cards-exhausted')
+    assert.equal(match.turn, null)
   })
 
   it('awards one space per correct answer and none for a pass', () => {
-    let match = startMatch(mixedTeams, localCards, { random: () => 0.4 })
+    let match = startCurrentTurn(startMatch(mixedTeams, localCards, { random: () => 0.4 }))
     assert.equal(match.turn?.role, 'human-guesses')
 
     const currentId = match.turn?.teamId
@@ -57,12 +189,13 @@ describe('MAXAKA local match engine', () => {
   })
 
   it('alternates the human and bot clue-giver roles within a mixed team', () => {
-    let match = startMatch(mixedTeams, localCards, { random: () => 0.4 })
+    let match = startCurrentTurn(startMatch(mixedTeams, localCards, { random: () => 0.4 }))
     assert.equal(match.turn?.role, 'human-guesses')
 
     for (let item = 0; item < 5; item += 1) {
       match = resolveCurrentItem(match, false, () => 0.4)
     }
+    match = startCurrentTurn(match)
     match = endAutomatedTurn(match, 0, () => 0.4)
 
     assert.equal(match.turn?.teamId, 1)
@@ -70,18 +203,21 @@ describe('MAXAKA local match engine', () => {
   })
 
   it('ends a human turn when its 30-second timer expires', () => {
-    let match = startMatch(mixedTeams, localCards, { random: () => 0.4 })
+    let match = startCurrentTurn(startMatch(mixedTeams, localCards, { random: () => 0.4 }))
+    const firstCardId = match.turn?.card.id
     for (let second = 0; second < TURN_SECONDS; second += 1) {
       match = tickMatch(match, () => 0.4)
     }
 
     assert.equal(match.secondsLeft, TURN_SECONDS)
+    assert.notEqual(match.turn?.card.id, firstCardId)
     assert.equal(match.turn?.teamId, 2)
     assert.equal(match.turn?.role, 'automated')
+    assert.equal(match.turnStatus, 'waiting')
   })
 
   it('keeps the match alive while other teams are still racing after a win', () => {
-    let match = startMatch(mixedTeams, localCards, { random: () => 0.4, boardLength: 2 })
+    let match = startCurrentTurn(startMatch(mixedTeams, localCards, { random: () => 0.4, boardLength: 2 }))
     match = resolveCurrentItem(match, true, () => 0.4)
     match = resolveCurrentItem(match, true, () => 0.4)
 
@@ -93,9 +229,10 @@ describe('MAXAKA local match engine', () => {
   })
 
   it('finishes the match only when every team has reached the final space', () => {
-    let match = startMatch(mixedTeams, localCards, { random: () => 0.4, boardLength: 2 })
+    let match = startCurrentTurn(startMatch(mixedTeams, localCards, { random: () => 0.4, boardLength: 2 }))
     match = resolveCurrentItem(match, true, () => 0.4)
     match = resolveCurrentItem(match, true, () => 0.4)
+    match = startCurrentTurn(match)
     match = endAutomatedTurn(match, 2, () => 0.4)
 
     assert.equal(match.status, 'finished')
@@ -104,7 +241,7 @@ describe('MAXAKA local match engine', () => {
   })
 
   it('applies an automated bot result and continues to the next team', () => {
-    const match = startMatch(mixedTeams, localCards, { random: () => 0.5 })
+    const match = firstTeamStarts()
     const next = endAutomatedTurn(match, 3, () => 0.5)
 
     assert.equal(next.teams.find((team) => team.id === 2)?.position, 3)

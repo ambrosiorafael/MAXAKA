@@ -1,35 +1,30 @@
 import { randomInt, randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { extname, resolve, sep } from 'node:path'
 import { Server as SocketServer, type Socket } from 'socket.io'
-import type { types as MediaTypes } from 'mediasoup-client'
+import { fileURLToPath } from 'node:url'
 import { z, ZodError } from 'zod'
+import type { ResultSetHeader, RowDataPacket } from 'mysql2'
+import type { PoolConnection } from 'mysql2/promise'
 import { avatarOptions, isAvatar } from '../src/game/avatars.ts'
-import { currentTeam, endAutomatedTurn, resolveCurrentItem, startMatch, tickMatch, type MatchState } from '../src/game/engine.ts'
+import { currentTeam, endAutomatedTurn, endMatchForCardExhaustion, replaceCurrentTurnCard, resolveCurrentItem, startCurrentTurn, startMatch, tickMatch, type MatchState } from '../src/game/engine.ts'
+import type { GameCard } from '../src/game/catalog.ts'
 import type {
   Ack,
   ClientToServerEvents,
   ChatMessageView,
+  MediaPeerView,
+  MediaSignal,
   MatchStateView,
   PrivateTurnView,
   RoomStateView,
+  RoomSettingsUpdate,
   ServerToClientEvents,
 } from '../src/realtime/protocol.ts'
-import { config } from './config.ts'
+import { config, isAllowedOrigin } from './config.ts'
 import { closeDatabase, database, initializeDatabase, loadPublishedCards } from './db.ts'
-import {
-  closeMediaWorker,
-  closeMemberMedia,
-  closeMemberMediaProducer,
-  closeRoomMedia,
-  closeRoomMediaKind,
-  connectMediaTransport,
-  consumeMedia,
-  createMediaTransport,
-  initializeMediaWorker,
-  joinMediaRoom,
-  produceMedia,
-  resumeMediaConsumer,
-} from './media.ts'
+import { createPeerIceServers } from './media.ts'
 import {
   claimRoomOwner,
   closeRoomDirectory,
@@ -46,7 +41,80 @@ type ServerSocketData = {
   roomCode?: string
 }
 
+const webRoot = fileURLToPath(new URL('../../dist/', import.meta.url))
+const contentTypes: Record<string, string> = {
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.ico': 'image/x-icon',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.webp': 'image/webp',
+  '.woff2': 'font/woff2',
+}
+
+async function serveWebApp(requestUrl: string | undefined, method: string | undefined, response: import('node:http').ServerResponse): Promise<void> {
+  if (method !== 'GET' && method !== 'HEAD') {
+    response.writeHead(405, { Allow: 'GET, HEAD' })
+    response.end()
+    return
+  }
+
+  let pathname: string
+  try {
+    pathname = decodeURIComponent(new URL(requestUrl ?? '/', 'http://localhost').pathname)
+  } catch {
+    response.writeHead(400)
+    response.end()
+    return
+  }
+
+  const requestedPath = resolve(webRoot, pathname === '/' ? 'index.html' : `.${pathname}`)
+  if (requestedPath !== resolve(webRoot) && !requestedPath.startsWith(`${resolve(webRoot)}${sep}`)) {
+    response.writeHead(403)
+    response.end()
+    return
+  }
+
+  try {
+    let file: Buffer
+    let filePath = requestedPath
+    try {
+      file = await readFile(filePath)
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error
+      if (extname(pathname)) {
+        response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+        response.end('Ficheiro não encontrado.')
+        return
+      }
+      filePath = resolve(webRoot, 'index.html')
+      file = await readFile(filePath)
+    }
+
+    const isHtml = extname(filePath) === '.html'
+    response.writeHead(200, {
+      'content-type': contentTypes[extname(filePath)] ?? 'application/octet-stream',
+      'cache-control': isHtml ? 'no-cache' : 'public, max-age=31536000, immutable',
+    })
+    response.end(method === 'HEAD' ? undefined : file)
+  } catch (error) {
+    console.error('Falha ao servir ficheiro da aplicação:', error)
+    response.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+    response.end('Erro ao carregar a aplicação.')
+  }
+}
+
 type AppSocket = Socket<ClientToServerEvents, ServerToClientEvents, Record<string, never>, ServerSocketData>
+
+type OnlineMatchDeck = {
+  deck: GameCard[]
+  nextCardIndex: number
+  usedCardIds: Set<string>
+}
 
 type RoomMember = {
   id: string
@@ -67,14 +135,18 @@ type OnlineRoom = {
   status: 'open' | 'playing' | 'finished'
   hostId: string
   teamCount: number
+  hintsEnabled: boolean
   mediaSettings: RoomStateView['mediaSettings']
   members: RoomMember[]
+  mediaMembers: Map<string, { peer: MediaPeerView; socketId: string }>
   matchId?: string
   match?: MatchState
+  onlineDeck?: OnlineMatchDeck
   teamDatabaseIds?: Map<number, string>
   turnDatabaseId?: string
   turnNumber: number
   giverMemberId?: string
+  starterMemberId?: string
   timer?: ReturnType<typeof setInterval>
   botTimer?: ReturnType<typeof setTimeout>
   closing: boolean
@@ -96,6 +168,7 @@ const createRoomSchema = z.object({
   name: nameSchema,
   avatar: avatarSchema,
   teamCount: z.number().int().min(2).max(5),
+  hintsEnabled: z.boolean().optional(),
   mediaSettings: z.object({
     audioEnabled: z.boolean(),
     videoEnabled: z.boolean(),
@@ -112,29 +185,36 @@ const teamSchema = z.object({ memberId: z.string().uuid(), teamId: z.number().in
 const addBotSchema = z.object({ teamId: z.number().int().min(1).max(5) })
 const resolveSchema = z.object({ correct: z.boolean() })
 const chatSchema = z.object({ text: z.string().trim().min(1).max(300) })
+const mediaSignalSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('description'),
+    description: z.object({
+      type: z.enum(['offer', 'answer']),
+      sdp: z.string().min(1).max(200_000),
+    }).strict(),
+  }).strict(),
+  z.object({
+    type: z.literal('candidate'),
+    candidate: z.object({
+      candidate: z.string().max(4096),
+      sdpMid: z.string().max(256).nullable().optional(),
+      sdpMLineIndex: z.number().int().min(0).max(255).nullable().optional(),
+      usernameFragment: z.string().max(256).nullable().optional(),
+    }).strict(),
+  }).strict(),
+])
+const mediaSignalRequestSchema = z.object({
+  toMemberId: z.string().uuid(),
+  signal: mediaSignalSchema,
+}).strict()
 const roomSettingsSchema = z.object({
+  hintsEnabled: z.boolean().optional(),
   audioEnabled: z.boolean().optional(),
   videoEnabled: z.boolean().optional(),
   textChatEnabled: z.boolean().optional(),
   mimeEnabled: z.boolean().optional(),
 }).strict().refine((settings) => Object.keys(settings).length > 0, 'Seleciona pelo menos uma permissão.')
-const closeProducerSchema = z.object({ producerId: z.string().min(1).max(128) })
-const transportSchema = z.object({ direction: z.enum(['send', 'receive']) })
-const connectTransportSchema = z.object({
-  transportId: z.string().min(1).max(128),
-  dtlsParameters: z.custom<MediaTypes.DtlsParameters>(isDtlsParameters),
-})
-const produceSchema = z.object({
-  transportId: z.string().min(1).max(128),
-  kind: z.enum(['audio', 'video']),
-  rtpParameters: z.custom<MediaTypes.RtpParameters>(isRtpParameters),
-})
-const consumeSchema = z.object({
-  transportId: z.string().min(1).max(128),
-  producerId: z.string().min(1).max(128),
-  rtpCapabilities: z.custom<MediaTypes.RtpCapabilities>(isRtpCapabilities),
-})
-const resumeConsumerSchema = z.object({ consumerId: z.string().min(1).max(128) })
+const MAX_AUDIO_CALL_PARTICIPANTS = 6
 
 const rooms = new Map<string, OnlineRoom>()
 const sessions = new Map<string, { roomCode: string; memberId: string }>()
@@ -144,16 +224,35 @@ const roomAlphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 
 const httpServer = createServer((request, response) => {
   if (request.method === 'GET' && request.url === '/health') {
+    void database.query('SELECT 1').then(
+      () => {
+        response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ status: 'ok', database: 'ok' }))
+      },
+      (error: unknown) => {
+        console.error('Verificação de saúde: ligação MySQL indisponível:', error)
+        response.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ status: 'error', database: 'unavailable' }))
+      },
+    )
+    return
+  }
+  if (request.method === 'GET' && request.url === '/health/live') {
     response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
     response.end(JSON.stringify({ status: 'ok' }))
     return
   }
-  response.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
-  response.end(JSON.stringify({ error: 'Rota não encontrada.' }))
+  void serveWebApp(request.url, request.method, response)
 })
 
 const io = new SocketServer<ClientToServerEvents, ServerToClientEvents, Record<string, never>, ServerSocketData>(httpServer, {
-  cors: { origin: config.CLIENT_ORIGIN, methods: ['GET', 'POST'] },
+  cors: {
+    origin: (requestOrigin, callback) => {
+      if (!requestOrigin) return callback(null, true)
+      callback(null, isAllowedOrigin(requestOrigin, config.CLIENT_ORIGIN))
+    },
+    methods: ['GET', 'POST'],
+  },
   connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000, skipMiddlewares: true },
 })
 
@@ -163,32 +262,6 @@ class RedirectError extends ClientError {
   constructor(message: string, readonly redirectTo: string) {
     super(message)
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function isDtlsParameters(value: unknown): value is MediaTypes.DtlsParameters {
-  if (!isRecord(value) || !Array.isArray(value.fingerprints) || value.fingerprints.length === 0) return false
-  if (value.role !== undefined && !['auto', 'client', 'server'].includes(String(value.role))) return false
-  return value.fingerprints.every((fingerprint) => (
-    isRecord(fingerprint)
-    && ['sha-1', 'sha-224', 'sha-256', 'sha-384', 'sha-512'].includes(String(fingerprint.algorithm))
-    && typeof fingerprint.value === 'string'
-  ))
-}
-
-function isRtpParameters(value: unknown): value is MediaTypes.RtpParameters {
-  return isRecord(value)
-    && Array.isArray(value.codecs)
-    && Array.isArray(value.headerExtensions)
-    && (value.encodings === undefined || Array.isArray(value.encodings))
-    && isRecord(value.rtcp)
-}
-
-function isRtpCapabilities(value: unknown): value is MediaTypes.RtpCapabilities {
-  return isRecord(value) && Array.isArray(value.codecs) && Array.isArray(value.headerExtensions)
 }
 
 function validate<T>(schema: z.ZodType<T>, input: unknown): T {
@@ -248,6 +321,7 @@ function roomView(room: OnlineRoom): RoomStateView {
     status: room.status,
     hostId: room.hostId,
     teamCount: room.teamCount,
+    hintsEnabled: room.hintsEnabled,
     mediaSettings: { ...room.mediaSettings },
     members: room.members.map(({ id, name, avatar, teamId, isBot, isHost, isOnline }) => ({
       id, name, avatar, teamId, isBot, isHost, isOnline,
@@ -265,8 +339,11 @@ function matchView(room: OnlineRoom): MatchStateView | undefined {
   const team = currentTeam(match)
   return {
     status: match.status,
+    endReason: match.endReason,
+    turnStatus: match.turnStatus,
     currentTeamId: team?.id ?? 0,
     currentTeamName: team?.name ?? '',
+    starterId: room.starterMemberId ?? null,
     secondsLeft: match.secondsLeft,
     boardLength: match.boardLength,
     winnerTeamId: match.winnerTeamId,
@@ -289,7 +366,7 @@ function publishMatch(room: OnlineRoom): void {
   if (state) io.to(room.code).emit('match:state', state)
 }
 
-function broadcastPrivateTurn(room: OnlineRoom): void {
+function broadcastPrivateTurn(room: OnlineRoom, emit = true): void {
   const match = room.match
   const team = match ? currentTeam(match) : undefined
   const turn = match?.turn
@@ -304,31 +381,50 @@ function broadcastPrivateTurn(room: OnlineRoom): void {
     room.giverMemberId = giver?.id
   }
 
-  for (const member of teammates) {
+  const starter = turn.role === 'human-gives'
+    ? giver
+    : turn.role === 'human-guesses'
+      ? teammates[0]
+      : room.members.find((member) => member.id === room.hostId && !member.isBot)
+        ?? room.members.find((member) => !member.isBot)
+  room.starterMemberId = starter?.id
+
+  for (const member of room.members) {
     if (!member.socketId) continue
     let privateTurn: PrivateTurnView
-    if (turn.role === 'automated') {
-      privateTurn = { teamId: team.id, role: 'automated', itemIndex: turn.itemIndex, category: turn.card.category }
+    const isActiveTeam = member.teamId === team.id
+    const common = {
+      teamId: team.id,
+      itemIndex: turn.itemIndex,
+      category: turn.card.category,
+      starterId: room.starterMemberId ?? null,
+      canStart: match.turnStatus === 'waiting' && member.id === room.starterMemberId,
+    }
+
+    if (!isActiveTeam) {
+      privateTurn = {
+        ...common,
+        role: 'watching',
+        items: turn.card.items.map(({ word }) => ({ word })),
+      }
+    } else if (turn.role === 'automated') {
+      privateTurn = { ...common, role: 'automated' }
     } else if (turn.role === 'human-guesses') {
       privateTurn = {
-        teamId: team.id,
+        ...common,
         role: 'human-guesses',
-        itemIndex: turn.itemIndex,
-        category: turn.card.category,
-        item: turn.card.items[turn.itemIndex],
+        ...(room.hintsEnabled ? { item: { hint: turn.card.items[turn.itemIndex].hint } } : {}),
       }
     } else if (member.id === giver?.id) {
       privateTurn = {
-        teamId: team.id,
+        ...common,
         role: 'human-gives',
-        itemIndex: turn.itemIndex,
-        category: turn.card.category,
-        items: turn.card.items,
+        items: turn.card.items.map(({ word }) => ({ word })),
       }
     } else {
-      privateTurn = { teamId: team.id, role: 'watching', itemIndex: turn.itemIndex, category: turn.card.category }
+      privateTurn = { ...common, role: 'watching' }
     }
-    io.to(member.socketId).emit('turn:private', privateTurn)
+    if (emit) io.to(member.socketId).emit('turn:private', privateTurn)
   }
 }
 
@@ -353,6 +449,7 @@ async function finishMatch(room: OnlineRoom): Promise<void> {
   if (room.turnDatabaseId) {
     await database.execute('UPDATE match_turns SET ended_at = CURRENT_TIMESTAMP WHERE id = ?', [room.turnDatabaseId])
   }
+  await database.execute("UPDATE match_used_items SET usage_status = 'used' WHERE match_id = ?", [matchId])
   const orderedTeams = [...match.teams].sort((left, right) => right.position - left.position || left.id - right.id)
   await database.execute(
     `UPDATE matches
@@ -370,27 +467,47 @@ async function finishMatch(room: OnlineRoom): Promise<void> {
       [matchId, teamDatabaseId, team.position, team.position, index + 1],
     )
   }
-  room.status = 'finished'
   await database.execute(
-    "UPDATE rooms SET status = 'finished', closed_at = CURRENT_TIMESTAMP WHERE id = ?",
+    "UPDATE rooms SET status = 'open', closed_at = NULL WHERE id = ?",
     [room.id],
   )
-  for (const member of room.members) {
-    await database.execute('DELETE FROM players WHERE id = ?', [member.id])
-  }
-  for (const member of room.members) {
-    if (member.sessionToken) sessions.delete(member.sessionToken)
-    member.sessionToken = undefined
-  }
+  room.status = 'open'
   if (room.timer) clearInterval(room.timer)
   if (room.botTimer) clearTimeout(room.botTimer)
 }
 
-async function persistTurn(room: OnlineRoom, previousTurnId?: string): Promise<void> {
-  if (previousTurnId) {
-    await database.execute('UPDATE match_turns SET ended_at = CURRENT_TIMESTAMP WHERE id = ?', [previousTurnId])
+async function reserveTurnItems(
+  connection: PoolConnection,
+  room: OnlineRoom,
+  matchId: string,
+  turnId: string,
+  card: GameCard,
+  playerId: string | null,
+  teamId: string,
+): Promise<void> {
+  const [rows] = await connection.execute<Array<RowDataPacket & { id: number; content_id: string | null }>>(
+    'SELECT id, content_id FROM card_items WHERE card_id = ? ORDER BY item_order',
+    [card.id],
+  )
+  if (rows.length !== 5 || rows.some((row) => !row.content_id)) {
+    throw new Error(`A carta "${card.id}" não tem cinco itens identificados no catálogo.`)
+  }
+  const contentIds = rows.map((row) => row.content_id!)
+  if (new Set(contentIds).size !== 5 || contentIds.some((id) => !card.items.some((item) => item.id === id))) {
+    throw new Error(`Os identificadores persistidos da carta "${card.id}" não correspondem ao catálogo.`)
   }
 
+  for (const row of rows) {
+    await connection.execute(
+      `INSERT INTO match_used_items
+         (match_id, room_id, turn_id, card_id, card_item_id, content_id, player_id, team_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [matchId, room.id, turnId, card.id, row.id, row.content_id, playerId, teamId],
+    )
+  }
+}
+
+async function persistTurn(room: OnlineRoom, previousTurnId?: string): Promise<void> {
   const match = room.match
   const matchId = room.matchId
   const teamDatabaseIds = room.teamDatabaseIds
@@ -401,22 +518,71 @@ async function persistTurn(room: OnlineRoom, previousTurnId?: string): Promise<v
     return
   }
 
-  const teamDatabaseId = teamDatabaseIds.get(team.id)
-  if (!teamDatabaseId) throw new Error(`A equipa ${team.id} não tem registo de base de dados.`)
-  room.turnDatabaseId = randomUUID()
-  room.turnNumber += 1
-  await database.execute(
-    `INSERT INTO match_turns (id, match_id, team_id, player_id, card_id, turn_number)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [
-      room.turnDatabaseId,
+  const connection = await database.getConnection()
+  try {
+    await connection.beginTransaction()
+    const onlineDeck = room.onlineDeck
+    let candidate: GameCard | undefined
+    while (onlineDeck && onlineDeck.nextCardIndex < onlineDeck.deck.length) {
+      const nextCard = onlineDeck.deck[onlineDeck.nextCardIndex++]
+      if (!nextCard || onlineDeck.usedCardIds.has(nextCard.id)) continue
+      onlineDeck.usedCardIds.add(nextCard.id)
+      candidate = nextCard
+      break
+    }
+    if (!candidate) {
+      await connection.rollback()
+      room.match = endMatchForCardExhaustion(match)
+      await finishMatch(room)
+      publishMatch(room)
+      publishRoom(room)
+      room.turnDatabaseId = undefined
+      return
+    }
+
+    room.match = replaceCurrentTurnCard(match, candidate)
+    const selectedTurn = room.match.turn
+    if (!selectedTurn) throw new Error('O motor perdeu a jogada durante a atribuição da carta.')
+    broadcastPrivateTurn(room, false)
+    const teamDatabaseId = teamDatabaseIds.get(team.id)
+    if (!teamDatabaseId) throw new Error(`A equipa ${team.id} não tem registo de base de dados.`)
+    const turnId = randomUUID()
+    const turnNumber = room.turnNumber + 1
+    if (previousTurnId) {
+      await connection.execute('UPDATE match_turns SET ended_at = CURRENT_TIMESTAMP WHERE id = ?', [previousTurnId])
+      await connection.execute("UPDATE match_used_items SET usage_status = 'used' WHERE turn_id = ?", [previousTurnId])
+    }
+    await connection.execute(
+      `INSERT INTO match_turns (id, match_id, team_id, player_id, card_id, turn_number)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        turnId,
+        matchId,
+        teamDatabaseId,
+        room.giverMemberId && selectedTurn.role === 'human-gives' ? room.giverMemberId : null,
+        selectedTurn.card.id,
+        turnNumber,
+      ],
+    )
+    await reserveTurnItems(
+      connection,
+      room,
       matchId,
+      turnId,
+      selectedTurn.card,
+      room.starterMemberId ?? null,
       teamDatabaseId,
-      room.giverMemberId && turn.role === 'human-gives' ? room.giverMemberId : null,
-      turn.card.id,
-      room.turnNumber,
-    ],
-  )
+    )
+    await connection.commit()
+    room.turnDatabaseId = turnId
+    room.turnNumber = turnNumber
+    broadcastPrivateTurn(room)
+  } catch (error) {
+    await connection.rollback()
+    throw error
+  } finally {
+    connection.release()
+  }
 }
 
 async function persistResolvedItem(room: OnlineRoom, itemIndex: number, correct: boolean): Promise<void> {
@@ -436,7 +602,7 @@ async function persistResolvedItem(room: OnlineRoom, itemIndex: number, correct:
 }
 
 function scheduleBotTurn(room: OnlineRoom): void {
-  if (!room.match || room.match.status !== 'playing' || room.match.turn?.role !== 'automated') return
+  if (!room.match || room.match.status !== 'playing' || room.match.turnStatus !== 'active' || room.match.turn?.role !== 'automated') return
   if (room.botTimer) clearTimeout(room.botTimer)
   const cardId = room.match.turn.card.id
   const teamIndex = room.match.currentTeamIndex
@@ -450,7 +616,7 @@ function scheduleBotTurn(room: OnlineRoom): void {
 
 async function completeBotTurn(room: OnlineRoom, cardId: string, teamIndex: number, played: number): Promise<void> {
   const current = room.match
-  if (!current || current.status !== 'playing' || current.turn?.role !== 'automated' || current.turn.card.id !== cardId) return
+  if (!current || current.status !== 'playing' || current.turnStatus !== 'active' || current.turn?.role !== 'automated' || current.turn.card.id !== cardId) return
   const score = 1 + ((cardId.length + teamIndex + played) % 4)
   const next = endAutomatedTurn(current, score)
   const turnId = room.turnDatabaseId
@@ -476,22 +642,21 @@ async function completeBotTurn(room: OnlineRoom, cardId: string, teamIndex: numb
     publishRoom(room)
     return
   }
+  if (room.timer) clearInterval(room.timer)
+  room.timer = undefined
   const previousTurnId = room.turnDatabaseId
-  broadcastPrivateTurn(room)
   await persistTurn(room, previousTurnId)
   publishMatch(room)
   scheduleBotTurn(room)
 }
 
 async function startNextTurn(room: OnlineRoom, previousTurnId?: string): Promise<void> {
-  broadcastPrivateTurn(room)
   await persistTurn(room, previousTurnId)
   publishMatch(room)
-  scheduleBotTurn(room)
 }
 
 function associateSocket(socket: AppSocket, room: OnlineRoom, member: RoomMember): void {
-  closeMemberMedia(room.code, member.id)
+  removeMediaMember(room, member.id)
   if (member.hostDisconnectTimer) clearTimeout(member.hostDisconnectTimer)
   member.hostDisconnectTimer = undefined
   member.socketId = socket.id
@@ -537,11 +702,11 @@ async function insertMember(room: OnlineRoom, name: string, avatar: string, team
 
 async function createRoom(socket: AppSocket, rawPayload: unknown): Promise<AckPayload> {
   const payload = validate(createRoomSchema, rawPayload)
-  const mediaSettings = payload.mediaSettings ?? {
-    audioEnabled: true,
-    videoEnabled: true,
-    textChatEnabled: true,
-    mimeEnabled: true,
+  const mediaSettings = {
+    audioEnabled: payload.mediaSettings?.audioEnabled ?? true,
+    videoEnabled: false,
+    textChatEnabled: payload.mediaSettings?.textChatEnabled ?? true,
+    mimeEnabled: payload.mediaSettings?.mimeEnabled ?? true,
   }
   const roomId = randomUUID()
   let code = createRoomCode()
@@ -565,8 +730,10 @@ async function createRoom(socket: AppSocket, rawPayload: unknown): Promise<AckPa
     status: 'open',
     hostId: '',
     teamCount: payload.teamCount,
+    hintsEnabled: payload.hintsEnabled ?? false,
     mediaSettings,
     members: [],
+    mediaMembers: new Map(),
     turnNumber: 0,
     closing: false,
     chatRate: new Map(),
@@ -587,8 +754,8 @@ async function createRoom(socket: AppSocket, rawPayload: unknown): Promise<AckPa
       [hostId, payload.name, payload.avatar],
     )
     await connection.execute(
-      `INSERT INTO rooms (id, room_code, host_player_id, team_count, allow_audio, allow_video, allow_text_chat, allow_mime)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO rooms (id, room_code, host_player_id, team_count, allow_audio, allow_video, allow_text_chat, allow_mime, allow_hints)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         room.id,
         room.code,
@@ -598,6 +765,7 @@ async function createRoom(socket: AppSocket, rawPayload: unknown): Promise<AckPa
         mediaSettings.videoEnabled,
         mediaSettings.textChatEnabled,
         mediaSettings.mimeEnabled,
+        room.hintsEnabled,
       ],
     )
     await connection.execute(
@@ -768,20 +936,29 @@ async function startOnlineMatch(socket: AppSocket): Promise<{ started: true }> {
     const invalidTeam = teams.find((team) => team.members.length < 2 || team.members.length > 6)
     if (invalidTeam) throw new ClientError(`${invalidTeam.name} precisa de ter entre 2 e 6 participantes.`)
     const cards = await loadPublishedCards()
-    const match = startMatch(teams, cards)
-    const firstTeam = currentTeam(match)
-    const firstTurn = match.turn
-    if (!firstTeam || !firstTurn) throw new Error('O motor não criou a primeira ronda.')
-
+    if (cards.length < 65_000) {
+      throw new ClientError('O catálogo online precisa de pelo menos 65.000 cartas válidas para iniciar a partida.')
+    }
     const matchId = randomUUID()
     const teamDatabaseIds = new Map<number, string>()
     const turnDatabaseId = randomUUID()
-    const firstGiver = firstTurn.role === 'human-gives'
-      ? room.members.find((member) => member.teamId === firstTeam.id && !member.isBot)
-      : undefined
+    let match: MatchState | undefined
+    let firstGiver: RoomMember | undefined
     const connection = await database.getConnection()
     try {
       await connection.beginTransaction()
+      match = startMatch(teams, cards, { allowRepeatedItems: true })
+      const firstTeam = currentTeam(match)
+      const firstTurn = match.turn
+      if (!firstTeam || !firstTurn) throw new Error('O motor não criou a primeira ronda.')
+      firstGiver = firstTurn.role === 'human-gives'
+        ? room.members.find((member) => member.teamId === firstTeam.id && !member.isBot)
+        : undefined
+      const firstRecipient = firstGiver
+        ?? room.members.find((member) => member.teamId === firstTeam.id && !member.isBot)
+        ?? room.members.find((member) => member.id === room.hostId && !member.isBot)
+        ?? room.members.find((member) => !member.isBot)
+
       await connection.execute(
         'INSERT INTO matches (id, room_id, mode, status) VALUES (?, ?, ?, ?)',
         [matchId, room.id, 'online', 'playing'],
@@ -803,6 +980,7 @@ async function startOnlineMatch(socket: AppSocket): Promise<{ started: true }> {
          VALUES (?, ?, ?, ?, ?, ?)`,
         [turnDatabaseId, matchId, firstTeamDatabaseId, firstGiver?.id ?? null, firstTurn.card.id, 1],
       )
+      await reserveTurnItems(connection, room, matchId, turnDatabaseId, firstTurn.card, firstRecipient?.id ?? null, firstTeamDatabaseId)
       await connection.commit()
     } catch (error) {
       await connection.rollback()
@@ -811,7 +989,15 @@ async function startOnlineMatch(socket: AppSocket): Promise<{ started: true }> {
       connection.release()
     }
 
+    if (!match) throw new Error('A partida não foi preparada.')
+    const initialCardId = match.turn?.card.id
+    if (!initialCardId) throw new Error('O baralho não atribuiu a primeira carta.')
     room.match = match
+    room.onlineDeck = {
+      deck: [...match.deck],
+      nextCardIndex: 1,
+      usedCardIds: new Set([initialCardId]),
+    }
     room.matchId = matchId
     room.teamDatabaseIds = teamDatabaseIds
     room.status = 'playing'
@@ -820,6 +1006,30 @@ async function startOnlineMatch(socket: AppSocket): Promise<{ started: true }> {
     room.giverMemberId = firstGiver?.id
     broadcastPrivateTurn(room)
     publishRoom(room)
+    publishMatch(room)
+    return { started: true }
+  })
+}
+
+async function startOnlineTurn(socket: AppSocket): Promise<{ started: true }> {
+  const room = getRoom(socket)
+  return withRoomLock(room, async () => {
+    const member = getMember(room, socket)
+    const match = room.match
+    if (!match || match.status !== 'playing' || !match.turn) throw new ClientError('Não há uma jogada à espera de começar.')
+    if (match.turnStatus !== 'waiting') throw new ClientError('Esta jogada já foi iniciada.')
+    if (!room.starterMemberId || member.id !== room.starterMemberId) {
+      throw new ClientError('Ainda não és responsável por iniciar esta jogada.')
+    }
+
+    if (!room.turnDatabaseId) throw new Error('A jogada à espera não tem registo persistente.')
+    const [updatedTurn] = await database.execute<ResultSetHeader>(
+      'UPDATE match_turns SET started_at = CURRENT_TIMESTAMP WHERE id = ? AND started_at IS NULL',
+      [room.turnDatabaseId],
+    )
+    if (updatedTurn.affectedRows !== 1) throw new Error('O registo da jogada não estava à espera do início.')
+    room.match = startCurrentTurn(match)
+    broadcastPrivateTurn(room)
     publishMatch(room)
     room.timer = setInterval(() => {
       void tickRoom(room).catch((error: unknown) => console.error('Falha ao atualizar a ronda:', error))
@@ -838,7 +1048,6 @@ async function tickRoom(room: OnlineRoom): Promise<void> {
   const next = tickMatch(current)
   if (next === current) return
   room.match = next
-  publishMatch(room)
   if (next.status === 'finished') {
     await finishMatch(room)
     publishMatch(room)
@@ -846,9 +1055,13 @@ async function tickRoom(room: OnlineRoom): Promise<void> {
     return
   }
   if (next.turn !== current.turn) {
+    if (room.timer) clearInterval(room.timer)
+    room.timer = undefined
     const previousTurnId = room.turnDatabaseId
     await persistPositions(room)
     await startNextTurn(room, previousTurnId)
+  } else {
+    publishMatch(room)
   }
   } finally {
     room.processing = false
@@ -864,6 +1077,7 @@ async function resolveOnlineItem(socket: AppSocket, rawPayload: unknown): Promis
     const turn = match?.turn
     const team = match ? currentTeam(match) : undefined
     if (!match || match.status !== 'playing' || !turn || !team) throw new ClientError('Não há uma ronda ativa.')
+    if (match.turnStatus !== 'active') throw new ClientError('Aguarda o jogador responsável iniciar a jogada.')
     if (turn.role === 'automated') throw new ClientError('Os bots ainda estão a jogar esta ronda.')
     if (member.isBot || member.teamId !== team.id) throw new ClientError('Só a equipa ativa pode responder.')
     if (turn.role === 'human-gives' && room.giverMemberId !== member.id) throw new ClientError('Só quem recebeu a carta pode confirmar o acerto.')
@@ -879,7 +1093,9 @@ async function resolveOnlineItem(socket: AppSocket, rawPayload: unknown): Promis
       publishRoom(room)
       return { resolved: true }
     }
-    if (next.turn !== turn) {
+    if (next.turn?.teamId !== turn.teamId || next.turn?.card.id !== turn.card.id) {
+      if (room.timer) clearInterval(room.timer)
+      room.timer = undefined
       await startNextTurn(room, room.turnDatabaseId)
     } else {
       broadcastPrivateTurn(room)
@@ -907,104 +1123,62 @@ function attachSession(socket: AppSocket): void {
   }
 }
 
-async function joinMedia(socket: AppSocket) {
+function mediaPeer(member: RoomMember): MediaPeerView {
+  return { memberId: member.id, memberName: member.name, memberAvatar: member.avatar }
+}
+
+function joinMedia(socket: AppSocket): { peers: MediaPeerView[]; iceServers: ReturnType<typeof createPeerIceServers> } {
   const room = getRoom(socket)
   if (room.status === 'finished') throw new ClientError('A sala já foi encerrada.')
-  if (!room.mediaSettings.audioEnabled && !room.mediaSettings.videoEnabled) {
-    throw new ClientError('O anfitrião desativou o áudio e o vídeo nesta sala.')
+  if (!room.mediaSettings.audioEnabled) throw new ClientError('O anfitrião desativou o áudio nesta sala.')
+  const member = getMember(room, socket)
+  const wasJoined = room.mediaMembers.has(member.id)
+  if (!wasJoined && room.mediaMembers.size >= MAX_AUDIO_CALL_PARTICIPANTS) {
+    throw new ClientError(`A chamada de áudio P2P suporta até ${MAX_AUDIO_CALL_PARTICIPANTS} participantes por sala.`)
   }
-  const member = getMember(room, socket)
-  return joinMediaRoom(room.code, member.id)
+  const peers = [...room.mediaMembers.values()]
+    .filter((entry) => entry.peer.memberId !== member.id)
+    .map((entry) => entry.peer)
+  room.mediaMembers.set(member.id, { peer: mediaPeer(member), socketId: socket.id })
+  if (!wasJoined) socket.to(room.code).emit('media:peer-joined', mediaPeer(member))
+  return {
+    peers,
+    iceServers: createPeerIceServers(config.MEDIA_TURN_URLS, config.MEDIA_TURN_SHARED_SECRET),
+  }
 }
 
-async function createTransport(
-  socket: AppSocket,
-  payload: { direction: 'send' | 'receive' },
-) {
+function sendMediaSignal(socket: AppSocket, payload: { toMemberId: string; signal: MediaSignal }): { sent: true } {
   const room = getRoom(socket)
   if (room.status === 'finished') throw new ClientError('A sala já foi encerrada.')
-  const member = getMember(room, socket)
-  return createMediaTransport(room.code, member.id, payload.direction)
-}
-
-async function connectTransport(
-  socket: AppSocket,
-  payload: { transportId: string; dtlsParameters: import('mediasoup-client').types.DtlsParameters },
-) {
-  const room = getRoom(socket)
-  if (room.status === 'finished') throw new ClientError('A sala já foi encerrada.')
-  const member = getMember(room, socket)
-  await connectMediaTransport(room.code, member.id, payload.transportId, payload.dtlsParameters)
-  return { connected: true as const }
-}
-
-async function publishMedia(
-  socket: AppSocket,
-  payload: {
-    transportId: string
-    kind: import('mediasoup-client').types.MediaKind
-    rtpParameters: import('mediasoup-client').types.RtpParameters
-  },
-) {
-  const room = getRoom(socket)
-  if (room.status === 'finished') throw new ClientError('A sala já foi encerrada.')
-  const member = getMember(room, socket)
-  if (payload.kind === 'audio' && !room.mediaSettings.audioEnabled) throw new ClientError('O anfitrião desativou o áudio nesta sala.')
-  if (payload.kind === 'video' && !room.mediaSettings.videoEnabled) throw new ClientError('O anfitrião desativou o vídeo nesta sala.')
-  return produceMedia(room.code, member.id, member.name, member.avatar, payload.transportId, payload.kind, payload.rtpParameters, (producer) => {
-    io.to(room.code).emit('media:producer-closed', producer)
-  }).then((result) => {
-    const producer = {
-      producerId: result.id,
-      memberId: member.id,
-      memberName: member.name,
-      memberAvatar: member.avatar,
-      kind: payload.kind,
-    }
-    io.to(room.code).emit('media:producer-added', producer)
-    return result
-  })
-}
-
-async function subscribeMedia(
-  socket: AppSocket,
-  payload: {
-    transportId: string
-    producerId: string
-    rtpCapabilities: import('mediasoup-client').types.RtpCapabilities
-  },
-) {
-  const room = getRoom(socket)
-  if (room.status === 'finished') throw new ClientError('A sala já foi encerrada.')
-  const member = getMember(room, socket)
-  return consumeMedia(room.code, member.id, payload.transportId, payload.producerId, payload.rtpCapabilities)
-}
-
-async function resumeConsumer(socket: AppSocket, payload: { consumerId: string }) {
-  const room = getRoom(socket)
-  if (room.status === 'finished') throw new ClientError('A sala já foi encerrada.')
-  const member = getMember(room, socket)
-  await resumeMediaConsumer(room.code, member.id, payload.consumerId)
-  return { resumed: true as const }
+  if (!room.mediaSettings.audioEnabled) throw new ClientError('O anfitrião desativou o áudio nesta sala.')
+  const sender = getMember(room, socket)
+  if (!room.mediaMembers.has(sender.id)) throw new ClientError('Entra na chamada antes de enviar sinalização.')
+  const recipient = room.mediaMembers.get(payload.toMemberId)
+  if (!recipient || recipient.peer.memberId === sender.id) throw new ClientError('O participante já não está na chamada.')
+  io.to(recipient.socketId).emit('media:signal', { from: mediaPeer(sender), signal: payload.signal })
+  return { sent: true }
 }
 
 function leaveMedia(socket: AppSocket): { left: true } {
   const room = getRoom(socket)
   const member = getMember(room, socket)
-  closeMemberMedia(room.code, member.id)
+  removeMediaMember(room, member.id)
   return { left: true }
 }
 
-function closeMediaProducer(socket: AppSocket, payload: { producerId: string }): { closed: true } {
-  const room = getRoom(socket)
-  const member = getMember(room, socket)
-  closeMemberMediaProducer(room.code, member.id, payload.producerId)
-  return { closed: true }
+function removeMediaMember(room: OnlineRoom, memberId: string): void {
+  if (room.mediaMembers.delete(memberId)) io.to(room.code).emit('media:peer-left', { memberId })
+}
+
+function closeRoomAudio(room: OnlineRoom): void {
+  if (room.mediaMembers.size === 0) return
+  room.mediaMembers.clear()
+  io.to(room.code).emit('media:closed')
 }
 
 async function updateRoomSettings(
   socket: AppSocket,
-  payload: Partial<RoomStateView['mediaSettings']>,
+  payload: RoomSettingsUpdate,
 ): Promise<{ room: RoomStateView }> {
   const settings = validate(roomSettingsSchema, payload)
   const room = getRoom(socket)
@@ -1012,16 +1186,24 @@ async function updateRoomSettings(
     const actor = getMember(room, socket)
     if (!actor.isHost) throw new ClientError('Só o anfitrião pode alterar as permissões da sala.')
     if (room.status !== 'open') throw new ClientError('As permissões ficam bloqueadas quando a partida começa.')
-    const nextSettings = { ...room.mediaSettings, ...settings }
+    if (settings.videoEnabled) throw new ClientError('Esta versão da sala suporta apenas chamadas de áudio.')
+    const nextSettings = { ...room.mediaSettings, ...settings, videoEnabled: false }
     await database.execute(
       `UPDATE rooms
-          SET allow_audio = ?, allow_video = ?, allow_text_chat = ?, allow_mime = ?
+          SET allow_audio = ?, allow_video = ?, allow_text_chat = ?, allow_mime = ?, allow_hints = ?
         WHERE id = ?`,
-      [nextSettings.audioEnabled, nextSettings.videoEnabled, nextSettings.textChatEnabled, nextSettings.mimeEnabled, room.id],
+      [
+        nextSettings.audioEnabled,
+        nextSettings.videoEnabled,
+        nextSettings.textChatEnabled,
+        nextSettings.mimeEnabled,
+        settings.hintsEnabled ?? room.hintsEnabled,
+        room.id,
+      ],
     )
-    if (room.mediaSettings.audioEnabled && !nextSettings.audioEnabled) closeRoomMediaKind(room.code, 'audio')
-    if (room.mediaSettings.videoEnabled && !nextSettings.videoEnabled) closeRoomMediaKind(room.code, 'video')
+    if (room.mediaSettings.audioEnabled && !nextSettings.audioEnabled) closeRoomAudio(room)
     room.mediaSettings = nextSettings
+    room.hintsEnabled = settings.hintsEnabled ?? room.hintsEnabled
     publishRoom(room)
     return { room: roomView(room) }
   })
@@ -1038,7 +1220,7 @@ async function leaveRoom(socket: AppSocket): Promise<{ left: true }> {
       await socket.leave(room.code)
       return { left: true }
     }
-    closeMemberMedia(room.code, member.id)
+    removeMediaMember(room, member.id)
     member.socketId = undefined
     member.isOnline = false
     if (member.sessionToken) sessions.delete(member.sessionToken)
@@ -1086,7 +1268,7 @@ async function closeRoom(room: OnlineRoom, message: string): Promise<void> {
     connection.release()
   }
 
-  closeRoomMedia(room.code)
+  closeRoomAudio(room)
   for (const member of room.members) {
     if (member.hostDisconnectTimer) clearTimeout(member.hostDisconnectTimer)
     if (member.sessionToken) sessions.delete(member.sessionToken)
@@ -1134,16 +1316,12 @@ io.on('connection', (socket) => {
   socket.on('room:add-bot', (payload, ack) => withAck(ack, () => addBot(socket, payload)))
   socket.on('room:leave', (ack) => withAck(ack, () => leaveRoom(socket)))
   socket.on('match:start', (ack) => withAck(ack, () => startOnlineMatch(socket)))
+  socket.on('turn:start', (ack) => withAck(ack, () => startOnlineTurn(socket)))
   socket.on('match:resolve', (payload, ack) => withAck(ack, () => resolveOnlineItem(socket, payload)))
   socket.on('chat:send', (payload, ack) => withAck(ack, async () => sendChat(socket, payload)))
-  socket.on('media:join', (ack) => withAck(ack, () => joinMedia(socket)))
-  socket.on('media:create-transport', (payload, ack) => withAck(ack, async () => createTransport(socket, validate(transportSchema, payload))))
-  socket.on('media:connect-transport', (payload, ack) => withAck(ack, async () => connectTransport(socket, validate(connectTransportSchema, payload))))
-  socket.on('media:produce', (payload, ack) => withAck(ack, async () => publishMedia(socket, validate(produceSchema, payload))))
-  socket.on('media:consume', (payload, ack) => withAck(ack, async () => subscribeMedia(socket, validate(consumeSchema, payload))))
-  socket.on('media:resume-consumer', (payload, ack) => withAck(ack, async () => resumeConsumer(socket, validate(resumeConsumerSchema, payload))))
+  socket.on('media:join', (ack) => withAck(ack, async () => joinMedia(socket)))
+  socket.on('media:signal', (payload, ack) => withAck(ack, async () => sendMediaSignal(socket, validate(mediaSignalRequestSchema, payload))))
   socket.on('media:leave', (ack) => withAck(ack, async () => leaveMedia(socket)))
-  socket.on('media:close-producer', (payload, ack) => withAck(ack, async () => closeMediaProducer(socket, validate(closeProducerSchema, payload))))
   socket.on('room:settings', (payload, ack) => withAck(ack, () => updateRoomSettings(socket, payload)))
   socket.on('disconnect', () => {
     void disconnectSocket(socket).catch((error: unknown) => console.error('Falha ao atualizar uma desconexão:', error))
@@ -1154,7 +1332,7 @@ async function disconnectSocket(socket: AppSocket): Promise<void> {
   const room = socket.data.roomCode ? rooms.get(socket.data.roomCode) : undefined
   const member = room?.members.find((candidate) => candidate.id === socket.data.memberId)
   if (!room || !member || member.socketId !== socket.id) return
-  closeMemberMedia(room.code, member.id)
+  removeMediaMember(room, member.id)
   member.isOnline = false
   member.socketId = undefined
   if (member.isHost) {
@@ -1171,9 +1349,8 @@ async function disconnectSocket(socket: AppSocket): Promise<void> {
 async function main(): Promise<void> {
   await initializeDatabase()
   await initializeRoomDirectory(io)
-  await initializeMediaWorker()
-  httpServer.listen(config.PORT, () => {
-    console.info(`MAXAKA server ativo na porta ${config.PORT}.`)
+  httpServer.listen(config.PORT, '0.0.0.0', () => {
+    console.info(`MAXAKA server ativo em 0.0.0.0:${config.PORT}.`)
   })
   const shutdown = async (): Promise<void> => {
     for (const room of [...rooms.values()]) {
@@ -1185,7 +1362,6 @@ async function main(): Promise<void> {
       await closeRoom(room, 'O servidor foi reiniciado. Cria uma nova sala para continuar a jogar.')
     }
     io.close()
-    await closeMediaWorker()
     await closeRoomDirectory()
     await closeDatabase()
   }

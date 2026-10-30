@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import test from 'node:test'
-import { createTurnIceServers } from './media.ts'
+import { createPeerIceServers, createTurnIceServers } from './media.ts'
+
+test('uses public STUN for peer audio and adds configured TURN relay servers', () => {
+  const iceServers = createPeerIceServers('turn:relay.example.test:3478', 'server-only-secret', 1000)
+  assert.deepEqual(iceServers[0], { urls: ['stun:stun.l.google.com:19302'] })
+  assert.equal(iceServers[1]?.urls[0], 'turn:relay.example.test:3478')
+  assert.equal(iceServers[1]?.username, '7201:maxaka')
+})
 
 test('leaves TURN disabled when no relay URLs are configured', () => {
   assert.deepEqual(createTurnIceServers('', ''), [])

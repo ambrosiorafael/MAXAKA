@@ -1,11 +1,31 @@
+@font-face {
+  font-family: 'Inter Variable';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('@fontsource-variable/inter/files/inter-latin-wght-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+
+@font-face {
+  font-family: 'Cascadia Code Variable';
+  font-style: normal;
+  font-weight: 200 700;
+  font-display: swap;
+  src: url('@fontsource-variable/cascadia-code/files/cascadia-code-latin-wght-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+
 :root {
   --orange: #fd7101;
   --orange-dark: #c95603;
   --gold: #fdd202;
   --ink: #29261f;
-  --display: 'Segoe UI', 'Trebuchet MS', sans-serif;
-  --mono: 'Cascadia Mono', Consolas, monospace;
+  --display: 'Inter Variable', 'Segoe UI', sans-serif;
+  --mono: 'Cascadia Code Variable', 'Cascadia Mono', monospace;
   font-family: var(--display);
+  font-style: normal;
+  font-weight: 400;
   color: var(--ink);
   background: #fffdf8;
   font-synthesis: none;
@@ -30,12 +50,20 @@ body {
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
+  font-family: var(--display);
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1.5;
+  font-synthesis: none;
 }
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
+  font-family: var(--display);
+  font-synthesis: none;
 }
 
 button:focus-visible,

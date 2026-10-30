@@ -28,6 +28,8 @@ export type ActiveTurn = {
 
 export type MatchState = {
   status: 'playing' | 'finished'
+  endReason: 'winner' | 'cards-exhausted' | null
+  turnStatus: 'waiting' | 'active'
   teams: MatchTeam[]
   deck: GameCard[]
   nextCardIndex: number
@@ -40,7 +42,7 @@ export type MatchState = {
 }
 
 export const TURN_SECONDS = 30
-export const DEFAULT_BOARD_LENGTH = 25
+export const DEFAULT_BOARD_LENGTH = 30
 
 function shuffled<T>(items: readonly T[], random: () => number): T[] {
   const result = [...items]
@@ -74,7 +76,12 @@ function makeTurn(state: MatchState, teamIndex: number, nextCardIndex: number): 
 export function startMatch(
   teams: readonly Omit<MatchTeam, 'position'>[],
   cards: readonly GameCard[],
-  options: { random?: () => number; boardLength?: number } = {},
+  options: {
+    random?: () => number
+    boardLength?: number
+    usedContentIds?: ReadonlySet<string>
+    allowRepeatedItems?: boolean
+  } = {},
 ): MatchState {
   const random = options.random ?? Math.random
   if (teams.length < 2) throw new Error('A partida precisa de pelo menos duas equipas.')
@@ -84,13 +91,22 @@ export function startMatch(
   }
   if (teams.some((team) => team.members.length === 0)) throw new Error('Todas as equipas precisam de participantes.')
 
-  const deck = shuffled(cards, random)
+  const reservedContentIds = new Set(options.usedContentIds)
+  const shuffledCards = shuffled(cards, random)
+  const uniqueDeck = options.allowRepeatedItems ? shuffledCards : shuffledCards.filter((card) => {
+    if (card.items.some((item) => reservedContentIds.has(item.id))) return false
+    for (const item of card.items) reservedContentIds.add(item.id)
+    return true
+  })
+  const deck = uniqueDeck.length > 0 ? uniqueDeck : shuffled(cards, random)
   const currentTeamIndex = Math.min(teams.length - 1, Math.floor(random() * teams.length))
   const state: MatchState = {
     status: 'playing',
+    endReason: null,
+    turnStatus: 'waiting',
     teams: teams.map((team) => ({ ...team, members: [...team.members], position: 0 })),
     deck,
-    nextCardIndex: 1 % deck.length,
+    nextCardIndex: 1,
     currentTeamIndex,
     teamTurnsPlayed: Object.fromEntries(teams.map((team) => [team.id, 0])),
     secondsLeft: TURN_SECONDS,
@@ -102,7 +118,40 @@ export function startMatch(
   return state
 }
 
-function advanceTurn(state: MatchState, random: () => number): MatchState {
+export function startCurrentTurn(state: MatchState): MatchState {
+  if (state.status !== 'playing' || !state.turn || state.turnStatus !== 'waiting') return state
+  return { ...state, turnStatus: 'active', secondsLeft: TURN_SECONDS }
+}
+
+export function replaceCurrentTurnCard(state: MatchState, card: GameCard): MatchState {
+  if (!state.turn || !state.deck.some((entry) => entry.id === card.id)) return state
+  const currentIndex = state.deck.findIndex((entry) => entry.id === state.turn?.card.id)
+  const replacementIndex = state.deck.findIndex((entry) => entry.id === card.id)
+  if (currentIndex < 0 || replacementIndex < 0) return state
+  const deck = [...state.deck]
+  ;[deck[currentIndex], deck[replacementIndex]] = [deck[replacementIndex]!, deck[currentIndex]!]
+  return {
+    ...state,
+    deck,
+    nextCardIndex: Math.max(state.nextCardIndex, replacementIndex + 1),
+    turn: { ...state.turn, card },
+  }
+}
+
+export function endMatchForCardExhaustion(state: MatchState): MatchState {
+  if (state.status !== 'playing') return state
+  return {
+    ...state,
+    status: 'finished',
+    endReason: 'cards-exhausted',
+    turnStatus: 'waiting',
+    secondsLeft: 0,
+    turn: null,
+    winnerTeamId: null,
+  }
+}
+
+function advanceTurn(state: MatchState): MatchState {
   if (state.status !== 'playing' || !state.turn) return state
   const finishedTeamId = state.turn.teamId
   const finishedTeamIndex = state.currentTeamIndex
@@ -116,33 +165,25 @@ function advanceTurn(state: MatchState, random: () => number): MatchState {
     attempts += 1
   }
 
-  const nextCardIndex = state.nextCardIndex
-  let deck = state.deck
-  let followingCardIndex = nextCardIndex
-  let afterNextCardIndex = nextCardIndex + 1
-
-  if (nextCardIndex >= deck.length) {
-    deck = shuffled(deck, random)
-    followingCardIndex = 0
-    afterNextCardIndex = 1 % deck.length
-  } else if (afterNextCardIndex >= deck.length) {
-    afterNextCardIndex = deck.length
-  }
-
   const teamTurnsPlayed = {
     ...state.teamTurnsPlayed,
     [finishedTeamId]: (state.teamTurnsPlayed[finishedTeamId] ?? 0) + 1,
   }
+
+  if (state.nextCardIndex >= state.deck.length) {
+    return endMatchForCardExhaustion({ ...state, teamTurnsPlayed })
+  }
+
   const nextState: MatchState = {
     ...state,
-    deck,
-    nextCardIndex: afterNextCardIndex,
+    turnStatus: 'waiting',
+    nextCardIndex: state.nextCardIndex + 1,
     currentTeamIndex: nextTeamIndex,
     teamTurnsPlayed,
     secondsLeft: TURN_SECONDS,
     turn: null,
   }
-  nextState.turn = makeTurn(nextState, nextTeamIndex, followingCardIndex)
+  nextState.turn = makeTurn(nextState, nextTeamIndex, state.nextCardIndex)
   return nextState
 }
 
@@ -158,13 +199,14 @@ function addMovement(state: MatchState, teamId: number, steps: number): MatchSta
     ...state,
     teams,
     status: allFinished ? 'finished' : state.status,
+    endReason: allFinished ? 'winner' : state.endReason,
     winnerTeamId: state.winnerTeamId ?? winner?.id ?? null,
     turn: allFinished ? null : state.turn,
   }
 }
 
-export function resolveCurrentItem(state: MatchState, correct: boolean, random: () => number = Math.random): MatchState {
-  if (state.status !== 'playing' || !state.turn || state.turn.role === 'automated') return state
+export function resolveCurrentItem(state: MatchState, correct: boolean, _random: () => number = Math.random): MatchState {
+  if (state.status !== 'playing' || state.turnStatus !== 'active' || !state.turn || state.turn.role === 'automated') return state
   if (state.turn.results[state.turn.itemIndex] !== 'pending') return state
 
   const result: ItemResult = correct ? 'correct' : 'skipped'
@@ -173,24 +215,24 @@ export function resolveCurrentItem(state: MatchState, correct: boolean, random: 
   const moved = correct ? addMovement({ ...state, turn }, state.turn.teamId, 1) : { ...state, turn }
 
   if (moved.status === 'finished') return moved
-  if (moved.winnerTeamId && !moved.teams.every((team) => team.position >= state.boardLength)) return advanceTurn(moved, random)
-  if (turn.itemIndex >= turn.results.length) return advanceTurn(moved, random)
+  if (moved.winnerTeamId && !moved.teams.every((team) => team.position >= state.boardLength)) return advanceTurn(moved)
+  if (turn.itemIndex >= turn.results.length) return advanceTurn(moved)
   return moved
 }
 
-export function endAutomatedTurn(state: MatchState, correctCount: number, random: () => number = Math.random): MatchState {
-  if (state.status !== 'playing' || !state.turn || state.turn.role !== 'automated') return state
+export function endAutomatedTurn(state: MatchState, correctCount: number, _random: () => number = Math.random): MatchState {
+  if (state.status !== 'playing' || state.turnStatus !== 'active' || !state.turn || state.turn.role !== 'automated') return state
   const score = Math.max(0, Math.min(5, Math.floor(correctCount)))
   const results: ItemResult[] = Array.from({ length: 5 }, (_, index) => index < score ? 'correct' : 'skipped')
   const moved = addMovement({ ...state, turn: { ...state.turn, results, itemIndex: 5 } }, state.turn.teamId, score)
   if (moved.status === 'finished') return moved
-  if (moved.winnerTeamId && !moved.teams.every((team) => team.position >= state.boardLength)) return advanceTurn(moved, random)
-  return advanceTurn(moved, random)
+  if (moved.winnerTeamId && !moved.teams.every((team) => team.position >= state.boardLength)) return advanceTurn(moved)
+  return advanceTurn(moved)
 }
 
-export function tickMatch(state: MatchState, random: () => number = Math.random): MatchState {
-  if (state.status !== 'playing' || !state.turn || state.turn.role === 'automated') return state
-  if (state.secondsLeft <= 1) return advanceTurn({ ...state, secondsLeft: 0 }, random)
+export function tickMatch(state: MatchState, _random: () => number = Math.random): MatchState {
+  if (state.status !== 'playing' || state.turnStatus !== 'active' || !state.turn || state.turn.role === 'automated') return state
+  if (state.secondsLeft <= 1) return advanceTurn({ ...state, secondsLeft: 0 })
   return { ...state, secondsLeft: state.secondsLeft - 1 }
 }
 

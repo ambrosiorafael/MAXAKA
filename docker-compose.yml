@@ -3,6 +3,8 @@ services:
     build:
       context: .
       target: web
+      args:
+        VITE_SERVER_URL: ${VITE_SERVER_URL:-}
     restart: unless-stopped
     depends_on:
       server:
@@ -12,6 +14,8 @@ services:
     build:
       context: .
       target: server
+      args:
+        VITE_SERVER_URL: ${VITE_SERVER_URL:-}
     restart: unless-stopped
     init: true
     environment:
@@ -26,19 +30,12 @@ services:
       MYSQL_QUEUE_LIMIT: ${MYSQL_QUEUE_LIMIT:-100}
       REDIS_URL: redis://:${REDIS_PASSWORD:?Define REDIS_PASSWORD in .env.production}@redis:6379/0
       INSTANCE_PUBLIC_URL: ${PUBLIC_URL:?Define PUBLIC_URL in .env.production}
-      CLIENT_ORIGIN: ${PUBLIC_URL:?Define PUBLIC_URL in .env.production}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:?Define CLIENT_ORIGIN in .env.production}
       HOST_RECONNECT_GRACE_MS: ${HOST_RECONNECT_GRACE_MS:-20000}
-      MEDIA_LISTEN_IP: 0.0.0.0
-      MEDIA_ANNOUNCED_ADDRESS: ${MEDIA_ANNOUNCED_ADDRESS:?Define MEDIA_ANNOUNCED_ADDRESS in .env.production}
-      MEDIA_RTC_MIN_PORT: ${MEDIA_RTC_MIN_PORT:-40000}
-      MEDIA_RTC_MAX_PORT: ${MEDIA_RTC_MAX_PORT:-49999}
       MEDIA_TURN_URLS: ${MEDIA_TURN_URLS:-}
       MEDIA_TURN_SHARED_SECRET: ${MEDIA_TURN_SHARED_SECRET:-}
     expose:
       - "3001"
-    ports:
-      - "${MEDIA_RTC_MIN_PORT:-40000}-${MEDIA_RTC_MAX_PORT:-49999}:${MEDIA_RTC_MIN_PORT:-40000}-${MEDIA_RTC_MAX_PORT:-49999}/udp"
-      - "${MEDIA_RTC_MIN_PORT:-40000}-${MEDIA_RTC_MAX_PORT:-49999}:${MEDIA_RTC_MIN_PORT:-40000}-${MEDIA_RTC_MAX_PORT:-49999}/tcp"
     depends_on:
       mysql:
         condition: service_healthy

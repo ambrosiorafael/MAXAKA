@@ -1,13 +1,15 @@
-import { lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react'
 import { io, type Socket } from 'socket.io-client'
 import './App.css'
 import BoardTrack from './components/BoardTrack.tsx'
 import { avatarCategories, avatarOptions, defaultAvatar, isAvatar } from './game/avatars.ts'
+import { readLocalUsedContentIds, recordLocalCardUsage } from './game/cardHistory.ts'
 import { localCards } from './game/catalog.ts'
 import {
   currentTeam,
   endAutomatedTurn,
   resolveCurrentItem,
+  startCurrentTurn,
   startMatch,
   tickMatch,
   type MatchState,
@@ -21,11 +23,41 @@ import type {
   ServerToClientEvents,
 } from './realtime/protocol.ts'
 
-type Screen = 'home' | 'profile' | 'mode' | 'setup' | 'match' | 'online-room' | 'online-match' | 'help' | 'credits'
+type Screen = 'home' | 'profile' | 'mode' | 'setup' | 'match' | 'online-room' | 'online-match' | 'help' | 'credits' | 'support' | 'helpdesk'
 type OnlineAction = 'create' | 'join' | null
 type RealtimeSocket = Socket<ServerToClientEvents, ClientToServerEvents>
 const configuredRealtimeServer = import.meta.env.VITE_SERVER_URL?.trim() || undefined
 const RoomMedia = lazy(() => import('./components/RoomMedia.tsx'))
+const supportCategories = [
+  'Conta e autenticação',
+  'Salas e convites',
+  'Problemas durante as partidas',
+  'Chat e áudio',
+  'Perguntas e respostas',
+  'Pagamentos e apoio financeiro',
+  'Erros técnicos',
+  'Sugestões de melhoria',
+  'Outros',
+] as const
+const supportWhatsAppUrl = 'https://wa.me/258845309072?text=Ol%C3%A1!%20Preciso%20de%20ajuda%20com%20o%20jogo%20MAXAKA.'
+const supportPhoneNumber = '+258 845 309 072'
+const supportFAQs = [
+  { question: 'Preciso de criar uma conta?', answer: 'Não. Podes jogar partidas locais sem conta. Nas salas online, o teu nome e perfil são temporários e associados à sala.' },
+  { question: 'Como se joga uma partida?', answer: 'Uma pessoa dá pistas para a equipa adivinhar os cinco itens da carta em 30 segundos. Cada acerto avança uma casa; passar não avança.' },
+  { question: 'Como crio uma sala e convido amigos?', answer: 'Escolhe “Jogar online” e cria uma sala. Partilha o código de seis caracteres com os teus amigos para entrarem.' },
+  { question: 'Como entro numa sala?', answer: 'Escolhe “Jogar online”, indica o código recebido e o teu nome para entrar na sala.' },
+  { question: 'O que faço se o chat não funcionar?', answer: 'Confirma que o anfitrião não desativou o chat nas permissões da sala e que a ligação à Internet está ativa.' },
+  { question: 'Como ativo o áudio?', answer: 'Entra na chamada da sala e ativa o microfone. O navegador pedirá autorização; permite o acesso apenas se quiseres. O áudio é ponto a ponto e algumas redes precisam de TURN.' },
+  { question: 'O jogo está lento ou não consigo entrar. O que faço?', answer: 'Atualiza a página, verifica a ligação e confirma o código da sala. Se o problema continuar, contacta o suporte e descreve o que aconteceu.' },
+  { question: 'Como envio uma captura de ecrã ao suporte?', answer: 'Prepara a mensagem no formulário e, depois de abrir o WhatsApp, anexa a imagem diretamente na conversa.' },
+  { question: 'Como faço um apoio financeiro?', answer: 'Consulta a secção “Apoiar o MAXAKA” para veres os métodos disponíveis. Se tiveres dúvidas, podes contactar o suporte pelo WhatsApp.' },
+] as const
+
+const supportMethods = [
+  { id: 'mpesa-sonia', name: 'M-Pesa', logo: '/payment-methods/mpesa.png', number: '845309072', holder: 'Sonia M--', detail: 'Número M-Pesa' },
+  { id: 'emola-ambrosio', name: 'eMola', logo: '/payment-methods/emola.png', number: '864001519', holder: 'Ambrósio Rafael', detail: 'Número eMola' },
+  { id: 'bim-ambrosio', name: 'Millennium BIM', logo: '/payment-methods/millennium-bim.png', number: '118769129', holder: 'Ambrósio Rafael', detail: 'Número de conta' },
+] as const
 
 type Player = {
   id: string
@@ -44,6 +76,48 @@ type Team = {
 const avatars = avatarOptions.map(({ emoji }) => emoji)
 const botNames = ['Paito', 'Ana', 'Maria', 'João', 'Marcos', 'José', 'Shelton', 'Sharmyla', 'Andressa', 'Winney', 'Sónia', 'Telma']
 const teamColors = ['orange', 'blue', 'green', 'purple', 'pink']
+const configuredRealtimeServer = import.meta.env.VITE_SERVER_URL?.trim() || undefined
+
+function HintSetting({
+  enabled,
+  onChange,
+  disabled = false,
+  description,
+}: {
+  enabled: boolean
+  onChange: (value: boolean) => void
+  disabled?: boolean
+  description?: string
+}) {
+  return (
+    <div className="hint-setting">
+      <div className="hint-setting-copy">
+        <strong>Pistas</strong>
+        <span>{description ?? (enabled ? 'Os jogadores podem ver pistas durante a partida.' : 'Não será apresentada nenhuma pista durante a partida.')}</span>
+      </div>
+      <div className="hint-setting-options" role="group" aria-label="Configuração de pistas">
+        <button
+          className={`hint-setting-option ${enabled ? 'hint-setting-option-active' : ''}`}
+          type="button"
+          aria-pressed={enabled}
+          disabled={disabled}
+          onClick={() => onChange(true)}
+        >
+          <span aria-hidden="true">💡</span> Activadas
+        </button>
+        <button
+          className={`hint-setting-option ${!enabled ? 'hint-setting-option-active' : ''}`}
+          type="button"
+          aria-pressed={!enabled}
+          disabled={disabled}
+          onClick={() => onChange(false)}
+        >
+          <span aria-hidden="true">🚫</span> Desactivadas
+        </button>
+      </div>
+    </div>
+  )
+}
 
 function loadSavedAvatar(): string {
   try {
@@ -84,16 +158,28 @@ function createTeams(count: number, player: Player): Team[] {
 
 function App() {
   const [screen, setScreen] = useState<Screen>('home')
+  const [supportSubject, setSupportSubject] = useState('')
+  const [supportCategory, setSupportCategory] = useState<(typeof supportCategories)[number]>(supportCategories[0])
+  const [supportDescription, setSupportDescription] = useState('')
+  const [supportScreenshotName, setSupportScreenshotName] = useState('')
+  const [preparedSupportUrl, setPreparedSupportUrl] = useState('')
+  const [supportCenterNotice, setSupportCenterNotice] = useState('')
+  const [supportPhoneNotice, setSupportPhoneNotice] = useState('')
   const [onlineAction, setOnlineAction] = useState<OnlineAction>(null)
   const [playerName, setPlayerName] = useState('')
   const [avatar, setAvatar] = useState(loadSavedAvatar)
   const [savedAvatar, setSavedAvatar] = useState(loadSavedAvatar)
   const [avatarCategoryId, setAvatarCategoryId] = useState(avatarCategories[0].id)
   const [avatarNotice, setAvatarNotice] = useState('')
+  const [supportNotice, setSupportNotice] = useState('')
+  const [copiedSupportMethod, setCopiedSupportMethod] = useState<string | null>(null)
   const [teamCount, setTeamCount] = useState(2)
+  const [createHintsEnabled, setCreateHintsEnabled] = useState(false)
+  const [localHintsEnabled, setLocalHintsEnabled] = useState(false)
+  const [shownHintKey, setShownHintKey] = useState('')
   const [createRoomSettings, setCreateRoomSettings] = useState<RoomStateView['mediaSettings']>({
     audioEnabled: true,
-    videoEnabled: true,
+    videoEnabled: false,
     textChatEnabled: true,
     mimeEnabled: true,
   })
@@ -107,6 +193,7 @@ function App() {
   const [onlineRoom, setOnlineRoom] = useState<RoomStateView | null>(null)
   const [onlineMatch, setOnlineMatch] = useState<MatchStateView | null>(null)
   const [privateTurn, setPrivateTurn] = useState<PrivateTurnView | null>(null)
+  const [turnStarting, setTurnStarting] = useState(false)
   const [chatMessages, setChatMessages] = useState<ChatMessageView[]>([])
   const [chatDraft, setChatDraft] = useState('')
   const matchRef = useRef(match)
@@ -121,42 +208,47 @@ function App() {
   const activeTeam = match ? currentTeam(match) : undefined
   const activeTurn = match?.turn
   const activeItem = activeTurn?.card.items[activeTurn.itemIndex]
+  const localHintKey = match && activeTurn
+    ? `local:${activeTurn.card.id}:${activeTurn.teamId}:${match.teamTurnsPlayed[activeTurn.teamId] ?? 0}:${activeTurn.itemIndex}`
+    : ''
+  const onlineHintKey = onlineMatch && privateTurn
+    ? `online:${onlineMatch.turnIndex}:${privateTurn.teamId}:${privateTurn.itemIndex}`
+    : ''
   const onlineTeamCounts = onlineRoom
     ? Array.from({ length: onlineRoom.teamCount }, (_, index) => onlineRoom.members.filter((member) => member.teamId === index + 1).length)
     : []
   const canStartOnline = onlineTeamCounts.length > 1 && onlineTeamCounts.every((count) => count >= 2 && count <= 6)
   const onlineWinner = onlineMatch?.teams.find((team) => team.id === onlineMatch.winnerTeamId)
+  const onlineStarterName = onlineRoom?.members.find((member) => member.id === privateTurn?.starterId)?.name
   const localWinner = match?.winnerTeamId !== null ? match?.teams.find((team) => team.id === match.winnerTeamId) : null
   const onlineWinnerInProgress = onlineMatch?.winnerTeamId !== null && onlineMatch?.teams.some((team) => team.position < onlineMatch.boardLength)
   const localWinnerInProgress = match?.winnerTeamId !== null && match?.teams.some((team) => team.position < match.boardLength)
   const selectedAvatarCategory = avatarCategories.find((category) => category.id === avatarCategoryId) ?? avatarCategories[0]
 
   useEffect(() => {
-    matchRef.current = match
-  }, [match])
-
-  useEffect(() => {
     const current = matchRef.current
-    if (!current || current.status !== 'playing' || current.turn?.role === 'automated') return
+    if (!current || current.status !== 'playing' || current.turnStatus !== 'active' || current.turn?.role === 'automated') return
     const timer = window.setInterval(() => {
-      setMatch((current) => current ? tickMatch(current) : current)
+      const currentMatch = matchRef.current
+      if (currentMatch) setLocalMatch(tickMatch(currentMatch))
     }, 1000)
     return () => window.clearInterval(timer)
-  }, [match?.status, match?.turn?.role])
+  }, [match?.status, match?.turnStatus, match?.turn?.role])
 
   useEffect(() => {
     const current = matchRef.current
-    if (!current || current.status !== 'playing' || current.turn?.role !== 'automated') return
+    if (!current || current.status !== 'playing' || current.turnStatus !== 'active' || current.turn?.role !== 'automated') return
     const cardId = current.turn.card.id
     const teamId = current.turn.teamId
     const turnsPlayed = current.teamTurnsPlayed[teamId] ?? 0
     const teamIndex = current.currentTeamIndex
     const timeout = window.setTimeout(() => {
       const simulatedCorrectCount = 1 + ((cardId.length + teamIndex + turnsPlayed) % 4)
-      setMatch((current) => current ? endAutomatedTurn(current, simulatedCorrectCount) : current)
+      const currentMatch = matchRef.current
+      if (currentMatch) setLocalMatch(endAutomatedTurn(currentMatch, simulatedCorrectCount))
     }, 2200)
     return () => window.clearTimeout(timeout)
-  }, [match?.status, match?.turn?.role, match?.turn?.card.id, match?.currentTeamIndex, match?.teamTurnsPlayed])
+  }, [match?.status, match?.turnStatus, match?.turn?.role, match?.turn?.card.id, match?.currentTeamIndex, match?.teamTurnsPlayed])
 
   function beginProfile() {
     setOnlineAction(null)
@@ -170,15 +262,20 @@ function App() {
   }
 
   function connectRealtime(): RealtimeSocket {
-    if (realtimeRef.current) return realtimeRef.current
+    const existingClient = realtimeRef.current
+    if (existingClient?.connected) return existingClient
+    existingClient?.disconnect()
+    realtimeRef.current = null
+    setRealtime(null)
+
     const token = sessionStorage.getItem('maxaka.session')
     const client = io(sessionStorage.getItem('maxaka.server') || configuredRealtimeServer, {
       auth: token ? { sessionToken: token } : {},
       reconnection: true,
-      reconnectionAttempts: 8,
       reconnectionDelay: 800,
     })
     client.on('connect', () => {
+      setNotice('')
       setRealtime(client)
       setMyOnlineMemberId(sessionStorage.getItem('maxaka.member') ?? '')
     })
@@ -209,7 +306,10 @@ function App() {
       client.disconnect()
     })
     client.on('server:error', setNotice)
-    client.on('connect_error', () => setNotice('Não foi possível ligar ao servidor. Confirma a configuração online e tenta novamente.'))
+    client.on('connect_error', (error) => {
+      console.error('Falha ao ligar à sala online:', error)
+      setNotice('Não foi possível ligar à sala. Tenta novamente.')
+    })
     client.on('disconnect', (reason) => {
       if (reason !== 'io client disconnect') setNotice('Ligação perdida. A tentar voltar à sala…')
     })
@@ -251,10 +351,10 @@ function App() {
       if (onlineAction === 'create') {
         client.timeout(5000).emit(
           'room:create',
-          { name: displayName, avatar, teamCount, mediaSettings: createRoomSettings },
+          { name: displayName, avatar, teamCount, hintsEnabled: createHintsEnabled, mediaSettings: createRoomSettings },
           (error, result) => {
             if (error || !result) {
-              setNotice('O servidor online não respondeu. Confirma MySQL e reinicia o servidor.')
+              setNotice('Não foi possível criar a sala. Verifica a ligação e tenta novamente.')
             } else if (result.ok) {
               sessionStorage.setItem('maxaka.session', result.data.sessionToken)
               sessionStorage.setItem('maxaka.member', result.data.memberId)
@@ -287,7 +387,7 @@ function App() {
               else ownerClient.once('connect', retryJoin)
               setNotice('A ligar-te ao servidor da sala…')
             } else if (error || !result) {
-              setNotice('O servidor online não respondeu. Confirma MySQL e reinicia o servidor.')
+              setNotice('Não foi possível entrar na sala. Verifica o código e tenta novamente.')
             } else if (result.ok) {
               sessionStorage.setItem('maxaka.session', result.data.sessionToken)
               sessionStorage.setItem('maxaka.member', result.data.memberId)
@@ -357,22 +457,70 @@ function App() {
 
   const canStartDemo = teams.length >= 2 && teams.every((team) => team.members.length >= 2 && team.members.length <= 6)
 
+  function setLocalMatch(nextMatch: MatchState | null): boolean {
+    const previousCardId = matchRef.current?.turn?.card.id
+    const nextCard = nextMatch?.turn?.card
+    if (nextCard && nextCard.id !== previousCardId) {
+      try {
+        recordLocalCardUsage(window.localStorage, nextCard, localCards)
+      } catch (error) {
+        console.error('Falha ao guardar o histórico local de conteúdos:', error)
+        setNotice('Não foi possível guardar o histórico das cartas neste navegador.')
+        return false
+      }
+    }
+    matchRef.current = nextMatch
+    setMatch(nextMatch)
+    return true
+  }
+
   function startDemo() {
     if (!canStartDemo) {
       setNotice('Cada equipa precisa de ter entre 2 e 6 jogadores.')
       return
     }
-    setNotice('')
-    setMatch(startMatch(teams, localCards))
-    setScreen('match')
+    try {
+      const usedContentIds = readLocalUsedContentIds(window.localStorage, localCards)
+      setNotice('')
+      setShownHintKey('')
+      try {
+        if (!setLocalMatch(startMatch(teams, localCards, { usedContentIds }))) return
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('conteúdos inéditos')) {
+          setNotice('Todos os conteúdos deste navegador já foram usados. Nenhuma palavra será repetida; adiciona conteúdos novos para iniciar outra partida.')
+          return
+        }
+        throw error
+      }
+      setScreen('match')
+    } catch (error) {
+      console.error('Falha ao iniciar a partida local:', error)
+      setNotice('Não foi possível carregar o histórico de cartas neste navegador.')
+    }
+  }
+
+  function startLocalTurn() {
+    const currentMatch = matchRef.current
+    if (currentMatch) setLocalMatch(startCurrentTurn(currentMatch))
   }
 
   function resolveItem(correct: boolean) {
-    setMatch((current) => current ? resolveCurrentItem(current, correct) : current)
+    const currentMatch = matchRef.current
+    if (currentMatch) setLocalMatch(resolveCurrentItem(currentMatch, correct))
   }
 
   function restartMatch() {
-    setMatch(startMatch(teams, localCards))
+    try {
+      const usedContentIds = readLocalUsedContentIds(window.localStorage, localCards)
+      setNotice('')
+      setShownHintKey('')
+      setLocalMatch(startMatch(teams, localCards, { usedContentIds }))
+    } catch (error) {
+      console.error('Falha ao reiniciar a partida local:', error)
+      setNotice(error instanceof Error && error.message.includes('conteúdos inéditos')
+        ? 'Todos os conteúdos deste navegador já foram usados. Nenhuma palavra será repetida; adiciona conteúdos novos para iniciar outra partida.'
+        : 'Não foi possível carregar o histórico de conteúdos neste navegador.')
+    }
   }
 
   function changeOnlineTeam(memberId: string, teamId: number) {
@@ -395,8 +543,29 @@ function App() {
 
   function startOnlineGame() {
     if (!realtime) return
-    realtime.timeout(5000).emit('match:start', (error, result) => {
+    setNotice('')
+    realtime.timeout(30000).emit('match:start', (error, result) => {
       if (error || !result) setNotice('O servidor não respondeu ao pedido de início.')
+      else if (!result.ok) setNotice(result.error)
+      else setNotice('')
+    })
+  }
+
+  function startOnlineTurn() {
+    if (!realtime || turnStarting) return
+    setTurnStarting(true)
+    realtime.timeout(5000).emit('turn:start', (error, result) => {
+      setTurnStarting(false)
+      if (error || !result) setNotice('Não foi possível iniciar a jogada. Tenta novamente.')
+      else if (!result.ok) setNotice(result.error)
+      else setNotice('')
+    })
+  }
+
+  function changeOnlineHints(enabled: boolean) {
+    if (!realtime) return
+    realtime.timeout(5000).emit('room:settings', { hintsEnabled: enabled }, (error, result) => {
+      if (error || !result) setNotice('A sala não respondeu à alteração das pistas.')
       else if (!result.ok) setNotice(result.error)
       else setNotice('')
     })
@@ -408,6 +577,56 @@ function App() {
       () => setNotice('Código copiado. Partilha-o com a tua equipa.'),
       () => setNotice('Não foi possível copiar o código. Podes selecioná-lo e copiá-lo manualmente.'),
     )
+  }
+
+  async function copySupportPhoneNumber() {
+    try {
+      await navigator.clipboard.writeText(supportPhoneNumber.replaceAll(' ', ''))
+      setSupportPhoneNotice('Número copiado.')
+    } catch {
+      setSupportPhoneNotice('Não foi possível copiar automaticamente. Seleciona o número e copia-o manualmente.')
+    }
+  }
+
+  function prepareSupportMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const message = [
+      'Olá! Preciso de ajuda com o jogo MAXAKA.',
+      `Assunto: ${supportSubject.trim()}`,
+      `Categoria: ${supportCategory}`,
+      `Descrição: ${supportDescription.trim()}`,
+      supportScreenshotName ? 'Tenho uma captura de ecrã para anexar nesta conversa.' : '',
+    ].filter(Boolean).join('\n')
+    setPreparedSupportUrl(`https://wa.me/258845309072?text=${encodeURIComponent(message)}`)
+    setSupportCenterNotice('Mensagem preparada. Abre o WhatsApp pelo link abaixo, revê e envia a mensagem. O MAXAKA não recebe nem confirma o envio.')
+  }
+
+  function selectSupportScreenshot(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    setPreparedSupportUrl('')
+    if (!file) {
+      setSupportScreenshotName('')
+      return
+    }
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 5 * 1024 * 1024) {
+      event.target.value = ''
+      setSupportScreenshotName('')
+      setSupportCenterNotice('Escolhe uma imagem PNG, JPEG ou WebP com até 5 MB.')
+      return
+    }
+    setSupportScreenshotName(file.name)
+    setSupportCenterNotice('')
+  }
+
+  async function copySupportNumber(methodId: string, number: string) {
+    try {
+      await navigator.clipboard.writeText(number)
+      setCopiedSupportMethod(methodId)
+      setSupportNotice('Número copiado. Obrigado por apoiares o MAXAKA!')
+    } catch {
+      setCopiedSupportMethod(null)
+      setSupportNotice('Não foi possível copiar automaticamente. Podes selecionar e copiar o número manualmente.')
+    }
   }
 
   function resolveOnlineItem(correct: boolean) {
@@ -458,7 +677,7 @@ function App() {
   function goBack() {
     setNotice('')
     if (screen === 'profile') setScreen('mode')
-    else if (screen === 'mode' || screen === 'help' || screen === 'credits') setScreen('home')
+    else if (screen === 'mode' || screen === 'help' || screen === 'credits' || screen === 'support' || screen === 'helpdesk') setScreen('home')
     else if (screen === 'setup') setScreen('mode')
     else if (screen === 'match') setScreen('setup')
     else if (screen === 'online-room' || screen === 'online-match') leaveOnlineRoom()
@@ -554,7 +773,7 @@ function App() {
                 <span className="mode-card-cta">Introduzir código <b>↗</b></span>
               </button>
             </div>
-            <div className="section-footnote"><span className="status-dot" /> As salas online precisam do backend e do MySQL configurados.</div>
+            <div className="section-footnote"><span className="status-dot" /> Cria uma sala privada ou entra com o código de convite.</div>
           </section>
         )}
 
@@ -583,11 +802,11 @@ function App() {
                     {[2, 3, 4, 5].map((count) => <option key={count} value={count}>{count} equipas</option>)}
                   </select>
                   <div className="field-caption">Cada equipa precisa de 2 a 6 participantes antes do início</div>
+                  <HintSetting enabled={createHintsEnabled} onChange={setCreateHintsEnabled} />
                   <span className="field-label">Regras de comunicação da sala</span>
                   <div className="create-room-settings">
                     {([
                       ['audioEnabled', 'Permitir áudio'],
-                      ['videoEnabled', 'Permitir vídeo'],
                       ['textChatEnabled', 'Permitir chat de texto'],
                       ['mimeEnabled', 'Permitir mímica'],
                     ] as const).map(([setting, label]) => (
@@ -601,7 +820,7 @@ function App() {
                       </label>
                     ))}
                   </div>
-                  <div className="field-caption">As permissões ficam bloqueadas quando a partida começar; microfone e câmara continuam sob controlo individual.</div>
+                  <div className="field-caption">Chamadas disponíveis apenas em áudio, ponto a ponto e limitadas a 6 pessoas por sala. As permissões ficam bloqueadas quando a partida começar.</div>
                 </>
               )}
               <span className="field-label">Escolhe o teu avatar</span>
@@ -662,6 +881,7 @@ function App() {
               </select>
               <span className="setup-note">Cada equipa: 2–6 jogadores</span>
             </div>
+            <HintSetting enabled={localHintsEnabled} onChange={setLocalHintsEnabled} />
             <div className="teams-grid">
               {teams.map((team) => (
                 <article className={`team-card team-${team.color} ${selectedTeam === team.id ? 'team-selected' : ''}`} key={team.id}>
@@ -705,14 +925,14 @@ function App() {
                 {match.status === 'finished' ? (
                   <div className="winner-banner" role="status">
                     <span className="winner-trophy">🏆</span>
-                    <div><span className="eyebrow">FIM DA PARTIDA</span><h1>{localWinner?.name ?? 'Partida terminada'} <span>venceu!</span></h1></div>
+                    <div><span className="eyebrow">FIM DA PARTIDA</span><h1>{match.endReason === 'cards-exhausted' ? 'Conteúdos esgotados' : `${localWinner?.name ?? 'Partida terminada'} venceu!`}</h1>{match.endReason === 'cards-exhausted' && <p>Todos os conteúdos disponíveis neste navegador já foram usados. Nenhuma palavra será repetida; adiciona conteúdos novos para continuar.</p>}</div>
                     <button className="button button-primary" type="button" onClick={restartMatch}>Jogar novamente <span aria-hidden="true">↻</span></button>
                   </div>
                 ) : (
                   <div className="match-header">
                     <div><span className="eyebrow">PARTIDA LOCAL · REGRAS EM EXECUÇÃO</span><h1>É hora de <span>jogar!</span></h1></div>
                     <div className={`timer-preview ${match.secondsLeft <= 10 ? 'timer-warning' : ''}`} aria-live="polite">
-                      <small>TEMPO DA RONDA</small><strong>00:{String(match.secondsLeft).padStart(2, '0')}</strong><span>{activeTurn?.role === 'automated' ? 'Bots a jogar' : 'Cronómetro ativo'}</span>
+                      <small>TEMPO DA RONDA</small><strong>00:{String(match.secondsLeft).padStart(2, '0')}</strong><span>{match.turnStatus === 'waiting' ? 'À espera do START' : activeTurn?.role === 'automated' ? 'Bots a jogar' : 'Cronómetro ativo'}</span>
                     </div>
                   </div>
                 )}
@@ -726,7 +946,7 @@ function App() {
                   <div className="turn-banner">
                     <span className={`team-token team-token-${activeTeam.color}`}>{activeTeam.id}</span>
                     <div><small>VEZ DA</small><strong>{activeTeam.name}</strong></div>
-                    <span className="turn-role">{activeTurn.role === 'human-guesses' ? 'Adivinha a pista do bot' : activeTurn.role === 'human-gives' ? 'Dá pistas à tua equipa' : 'A equipa de bots está a jogar'}</span>
+                    <span className="turn-role">{activeTurn.role === 'human-guesses' ? localHintsEnabled ? 'Adivinha com pistas opcionais' : 'Adivinha sem pistas' : activeTurn.role === 'human-gives' ? 'Dá pistas à tua equipa' : 'A equipa de bots está a jogar'}</span>
                     <span className="turn-card-count">CARTA {activeTurn.itemIndex + 1} / 5</span>
                   </div>
                 )}
@@ -739,8 +959,16 @@ function App() {
                       </div>
                       {activeTurn.role === 'human-guesses' ? (
                         <>
-                          <div className="preview-card-word hint-word">{activeItem?.hint}</div>
-                          <p>O bot dá a pista. Adivinha o item e confirma quando a equipa acertar.</p>
+                          {localHintsEnabled ? shownHintKey === localHintKey ? (
+                            <div className="preview-card-word hint-word">{activeItem?.hint}</div>
+                          ) : (
+                            <button className="button button-secondary reveal-hint-button" type="button" onClick={() => setShownHintKey(localHintKey)}>
+                              Ver pista <span aria-hidden="true">💡</span>
+                            </button>
+                          ) : (
+                            <div className="online-waiting-card">Pistas desactivadas nesta partida.</div>
+                          )}
+                          <p>{localHintsEnabled ? 'O bot dá a pista. Adivinha o item e confirma quando a equipa acertar.' : 'Adivinha o item sem pistas e confirma quando a equipa acertar.'}</p>
                         </>
                       ) : activeTurn.role === 'human-gives' ? (
                         <>
@@ -760,7 +988,13 @@ function App() {
                           <p>Os bots desta equipa estão a jogar a ronda automaticamente…</p>
                         </>
                       )}
-                      {activeTurn.role !== 'automated' && (
+                      {match.turnStatus === 'waiting' ? (
+                        <div className="game-actions">
+                          <button className="button button-primary button-start-turn" type="button" onClick={startLocalTurn}>
+                            START — INICIAR JOGADA <span aria-hidden="true">→</span>
+                          </button>
+                        </div>
+                      ) : activeTurn.role !== 'automated' && (
                         <div className="game-actions">
                           <button className="button button-secondary skip-button" type="button" onClick={() => resolveItem(false)}>Passar <span aria-hidden="true">↷</span></button>
                           <button className="button button-primary" type="button" onClick={() => resolveItem(true)}>{activeTurn.role === 'human-guesses' ? 'Acertámos!' : 'A equipa acertou'} <span aria-hidden="true">✓</span></button>
@@ -813,6 +1047,16 @@ function App() {
                 <div className="setup-toolbar">
                   <strong>Equipas</strong><span className="setup-note">{onlineRoom.members.length} participantes · {onlineRoom.teamCount} equipas</span>
                 </div>
+                <HintSetting
+                  enabled={onlineRoom.hintsEnabled}
+                  onChange={changeOnlineHints}
+                  disabled={onlineRoom.status !== 'open' || onlineRoom.hostId !== myOnlineMemberId}
+                  description={onlineRoom.status === 'open'
+                    ? onlineRoom.hostId === myOnlineMemberId
+                      ? onlineRoom.hintsEnabled ? 'Os jogadores poderão ver pistas durante a partida.' : 'Nenhuma pista será apresentada durante a partida.'
+                      : `O anfitrião escolheu: ${onlineRoom.hintsEnabled ? 'activadas' : 'desactivadas'}.`
+                    : `Configuração bloqueada: ${onlineRoom.hintsEnabled ? 'activadas' : 'desactivadas'}.`}
+                />
                 <div className="teams-grid">
                   {Array.from({ length: onlineRoom.teamCount }, (_, index) => {
                     const teamId = index + 1
@@ -831,6 +1075,7 @@ function App() {
                               <span className="member-avatar">{member.avatar}</span>
                               <span className="member-name">{member.name}{member.id === myOnlineMemberId ? <small>Tu</small> : null}</span>
                               {member.isHost && <span className="host-chip">ANFITRIÃO</span>}
+                              {!member.isHost && !member.isBot && <span className="guest-chip">CONVIDADO</span>}
                               {member.isBot && <span className="bot-chip">BOT</span>}
                               <span className={`connection-dot ${member.isOnline ? 'connection-online' : ''}`} aria-label={member.isOnline ? 'Ligado' : 'Desligado'} />
                               {onlineRoom.status === 'open' && (onlineRoom.hostId === myOnlineMemberId || member.id === myOnlineMemberId) && (
@@ -879,7 +1124,7 @@ function App() {
               <>
                 <div className="match-header">
                   <div><span className="eyebrow">PARTIDA ONLINE · ESTADO SINCRONIZADO</span><h1>É hora de <span>jogar!</span></h1></div>
-                  <div className={`timer-preview ${onlineMatch.secondsLeft <= 10 ? 'timer-warning' : ''}`} aria-live="polite"><small>TEMPO DA RONDA</small><strong>00:{String(onlineMatch.secondsLeft).padStart(2, '0')}</strong><span>Cronómetro do servidor</span></div>
+                  <div className={`timer-preview ${onlineMatch.turnStatus === 'active' && onlineMatch.secondsLeft <= 10 ? 'timer-warning' : ''}`} aria-live="polite"><small>TEMPO DA RONDA</small><strong>00:{String(onlineMatch.secondsLeft).padStart(2, '0')}</strong><span>{onlineMatch.turnStatus === 'waiting' ? 'À espera do START' : 'Cronómetro sincronizado'}</span></div>
                 </div>
                 {onlineWinnerInProgress && onlineWinner && (
                   <div className="winner-banner winner-banner-inline" role="status">
@@ -890,22 +1135,46 @@ function App() {
                 <div className="turn-banner">
                   <span className={`team-token team-token-${onlineMatch.teams.find((team) => team.id === onlineMatch.currentTeamId)?.color ?? 'orange'}`}>{onlineMatch.currentTeamId}</span>
                   <div><small>VEZ DA</small><strong>{onlineMatch.currentTeamName}</strong></div>
-                  <span className="turn-role">{privateTurn?.teamId === onlineMatch.currentTeamId ? privateTurn.role === 'human-guesses' ? 'Adivinha a pista' : privateTurn.role === 'human-gives' ? 'Dá pistas à equipa' : privateTurn.role === 'watching' ? 'À espera de quem dá as pistas' : 'Os bots estão a jogar' : 'A outra equipa está a jogar'}</span>
+                  <span className="turn-role">{onlineMatch.turnStatus === 'waiting' ? `Aguarda START${onlineStarterName ? ` de ${onlineStarterName}` : ''}` : privateTurn?.teamId === onlineMatch.currentTeamId ? privateTurn.role === 'human-guesses' ? onlineRoom.hintsEnabled ? 'Adivinha com pistas opcionais' : 'Adivinha sem pistas' : privateTurn.role === 'human-gives' ? 'Dá pistas à equipa' : privateTurn.role === 'watching' ? 'À espera de quem dá as pistas' : 'Os bots estão a jogar' : 'A outra equipa está a jogar'}</span>
                   <span className="turn-card-count">CARTA {Math.min(5, (privateTurn?.itemIndex ?? 0) + 1)} / 5</span>
                 </div>
                 <div className="match-layout">
                   <div className="preview-card active-game-card">
                     <div className="preview-card-top"><span>{privateTurn?.category.toLocaleUpperCase('pt-PT') ?? 'RONDA'}</span><span>{Math.min(5, (privateTurn?.itemIndex ?? 0) + 1)} / 5</span></div>
-                    {privateTurn?.teamId !== onlineMatch.currentTeamId || !privateTurn ? (
-                      <div className="online-waiting-card">A equipa está a jogar.<br /><span>Prepara-te para a próxima ronda.</span></div>
+                    {onlineMatch.turnStatus === 'waiting' && privateTurn?.items ? (
+                      <><div className="giver-word-list">{privateTurn.items.map((item, index) => <div className="giver-word" key={`${privateTurn.category}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span><strong>{item.word}</strong></div>)}</div><p>Cartas visíveis para acompanhar a jogada. Aguarda o início do cronómetro.</p></>
+                    ) : onlineMatch.turnStatus === 'waiting' ? (
+                      <div className="online-waiting-card">A jogada está preparada.<br /><span>{onlineStarterName ? `${onlineStarterName} inicia quando estiver pronto.` : 'Aguarda o jogador responsável pelo START.'}</span></div>
+                    ) : privateTurn?.teamId !== onlineMatch.currentTeamId || !privateTurn ? (
+                      privateTurn?.items ? (
+                        <><div className="giver-word-list">{privateTurn.items.map((item, index) => <div className={`giver-word ${index === privateTurn.itemIndex ? 'giver-word-current' : index < privateTurn.itemIndex ? 'giver-word-done' : ''}`} key={`${privateTurn.category}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span><strong>{item.word}</strong></div>)}</div><p>Acompanha a carta da equipa em jogo.</p></>
+                      ) : <div className="online-waiting-card">A equipa está a jogar.<br /><span>Prepara-te para a próxima ronda.</span></div>
                     ) : privateTurn.role === 'human-guesses' ? (
-                      <><div className="preview-card-word hint-word">{privateTurn.item?.hint}</div><p>O colega dá a pista. Confirma o acerto ou passa.</p></>
+                      <>
+                        {onlineRoom.hintsEnabled ? shownHintKey === onlineHintKey ? (
+                          <div className="preview-card-word hint-word">{privateTurn.item?.hint}</div>
+                        ) : (
+                          <button className="button button-secondary reveal-hint-button" type="button" onClick={() => setShownHintKey(onlineHintKey)}>
+                            Ver pista <span aria-hidden="true">💡</span>
+                          </button>
+                        ) : (
+                          <div className="online-waiting-card">Pistas desactivadas nesta partida.</div>
+                        )}
+                        <p>{onlineRoom.hintsEnabled ? 'O colega dá a pista. Confirma o acerto ou passa.' : 'Adivinha o item sem pistas. Confirma o acerto ou passa.'}</p>
+                      </>
                     ) : privateTurn.role === 'human-gives' ? (
                       <><div className="giver-word-list">{privateTurn.items?.map((item, index) => <div className={`giver-word ${index === privateTurn.itemIndex ? 'giver-word-current' : index < privateTurn.itemIndex ? 'giver-word-done' : ''}`} key={`${privateTurn.category}-${index}`}><span>{index < privateTurn.itemIndex ? '✓' : String(index + 1).padStart(2, '0')}</span><strong>{item.word}</strong></div>)}</div><p>Esta carta só é visível para ti. Dá pistas e confirma cada acerto.</p></>
                     ) : privateTurn.role === 'watching' ? (
-                      <div className="online-waiting-card">O colega está a dar pistas.<br /><span>A carta fica visível apenas para quem a recebeu.</span></div>
+                      <div className="online-waiting-card">O colega está a dar pistas.<br /><span>A equipa adversária vê os conteúdos para fiscalizar.</span></div>
                     ) : <div className="online-waiting-card">Os bots estão a jogar esta ronda…</div>}
-                    {privateTurn?.teamId === onlineMatch.currentTeamId && (privateTurn.role === 'human-gives' || privateTurn.role === 'human-guesses') && (
+                    {onlineMatch.turnStatus === 'waiting' && privateTurn?.canStart && (
+                      <div className="game-actions">
+                        <button className="button button-primary button-start-turn" type="button" disabled={turnStarting} onClick={startOnlineTurn}>
+                          {turnStarting ? 'A INICIAR…' : 'START — INICIAR JOGADA'} <span aria-hidden="true">→</span>
+                        </button>
+                      </div>
+                    )}
+                    {onlineMatch.turnStatus === 'active' && privateTurn?.teamId === onlineMatch.currentTeamId && (privateTurn.role === 'human-gives' || privateTurn.role === 'human-guesses') && (
                       <div className="game-actions">
                         <button className="button button-secondary skip-button" type="button" onClick={() => resolveOnlineItem(false)}>Passar <span aria-hidden="true">↷</span></button>
                         <button className="button button-primary" type="button" onClick={() => resolveOnlineItem(true)}>{privateTurn.role === 'human-gives' ? 'A equipa acertou' : 'Acertámos!'} <span aria-hidden="true">✓</span></button>
@@ -927,7 +1196,19 @@ function App() {
               </>
             ) : (
               <>
-                <div className="winner-banner" role="status"><span className="winner-trophy">🏆</span><div><span className="eyebrow">FIM DA PARTIDA ONLINE</span><h1>{onlineWinner?.name ?? 'Partida terminada'} <span>venceu!</span></h1></div><button className="button button-primary" type="button" onClick={leaveOnlineRoom}>Voltar ao menu <span aria-hidden="true">→</span></button></div>
+                <div className="winner-banner" role="status">
+                  <span className="winner-trophy">{onlineMatch.endReason === 'cards-exhausted' ? '📚' : '🏆'}</span>
+                  <div>
+                    <span className="eyebrow">FIM DA PARTIDA ONLINE</span>
+                    <h1>{onlineMatch.endReason === 'cards-exhausted' ? 'Baralho desta partida terminou' : `${onlineWinner?.name ?? 'Partida terminada'} venceu!`}</h1>
+                    {onlineMatch.endReason === 'cards-exhausted' && <p>As cartas desta partida foram usadas. O anfitrião pode iniciar outra partida com um baralho novo.</p>}
+                  </div>
+                  {onlineRoom.hostId === myOnlineMemberId ? (
+                    <button className="button button-primary" type="button" onClick={startOnlineGame}>Nova partida <span aria-hidden="true">↻</span></button>
+                  ) : (
+                    <button className="button button-primary" type="button" onClick={leaveOnlineRoom}>Voltar ao menu <span aria-hidden="true">→</span></button>
+                  )}
+                </div>
                 <div className="board-panel live-board-panel">
                   <div className="board-panel-heading"><div><span className="eyebrow">TABULEIRO FINAL · META NA CASA {onlineMatch.boardLength}</span><strong>Corrida até à meta</strong></div><span className="finish-flag">🏁</span></div>
                   <BoardTrack teams={onlineMatch.teams} boardLength={onlineMatch.boardLength} activeTeamId={onlineMatch.winnerTeamId ?? 0} />
@@ -946,7 +1227,7 @@ function App() {
               <div className="rule-row"><span>02</span><p>A equipa tem 30 segundos. Falar, escrever e fazer mímica são permitidos.</p></div>
               <div className="rule-row"><span>03</span><p>Quem vê a carta confirma cada acerto. Passar não avança; cada acerto vale uma casa.</p></div>
               <div className="rule-row"><span>04</span><p>Ganha a primeira equipa a alcançar ou ultrapassar a casa final.</p></div>
-              <p className="demo-disclaimer">Na partida local, os bots jogam automaticamente. As salas online requerem um servidor e uma base de dados MySQL configurados.</p>
+              <p className="demo-disclaimer">Na partida local, os bots jogam automaticamente. Nas salas online, podes jogar com amigos usando o código da sala.</p>
             </div>
           </section>
         )}
@@ -964,6 +1245,117 @@ function App() {
             </div>
           </section>
         )}
+
+        {screen === 'helpdesk' && (
+          <section className="content-section helpdesk-section">
+            <div className="section-heading">
+              <span className="eyebrow">MAXAKA · ESTAMOS AQUI PARA AJUDAR</span>
+              <h1>Suporte</h1>
+              <p>Entra em contacto diretamente ou consulta as respostas às dúvidas mais comuns.</p>
+            </div>
+
+            <div className="support-contact-grid">
+              <article className="info-panel support-contact-card">
+                <span className="support-contact-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none"><path d="M20 11.5a8 8 0 0 1-11.8 7L4 20l1.5-4.1A8 8 0 1 1 20 11.5Z" /><path d="M9 8.5c.4 2.3 1.7 3.6 4 4" /></svg>
+                </span>
+                <h2>WhatsApp</h2>
+                <p>Envia uma mensagem ao suporte MAXAKA.</p>
+                <strong className="support-contact-number">{supportPhoneNumber}</strong>
+                <a className="button button-primary" href={supportWhatsAppUrl} target="_blank" rel="noreferrer">
+                  Contactar pelo WhatsApp <span aria-hidden="true">↗</span>
+                </a>
+              </article>
+              <article className="info-panel support-contact-card">
+                <span className="support-contact-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none"><path d="M7 3H4.8A1.8 1.8 0 0 0 3 4.8C3 13.7 10.3 21 19.2 21a1.8 1.8 0 0 0 1.8-1.8V17l-5-2-1.5 2a14 14 0 0 1-6.5-6.5L10 9 8 4 7 3Z" /></svg>
+                </span>
+                <h2>Chamada telefónica</h2>
+                <p>Se preferires, liga diretamente para o suporte.</p>
+                <strong className="support-contact-number">{supportPhoneNumber}</strong>
+                <div className="support-contact-actions">
+                  <a className="button button-primary" href="tel:+258845309072">Ligar para o suporte <span aria-hidden="true">↗</span></a>
+                  <button className="button button-secondary" type="button" onClick={() => void copySupportPhoneNumber()}>Copiar número</button>
+                </div>
+                <p className="support-contact-notice" role="status" aria-live="polite">{supportPhoneNotice}</p>
+              </article>
+            </div>
+
+            <div className="support-center-grid">
+              <section className="info-panel support-request-panel">
+                <h2>Contactar o suporte</h2>
+                <p>Preenche os dados para preparar uma mensagem no WhatsApp. Revê e envia-a na aplicação.</p>
+                <form className="support-request-form" onSubmit={prepareSupportMessage}>
+                  <label htmlFor="support-subject">Assunto do pedido</label>
+                  <input id="support-subject" name="subject" maxLength={100} required value={supportSubject} onChange={(event) => { setSupportSubject(event.target.value); setPreparedSupportUrl(''); setSupportCenterNotice('') }} placeholder="Resume o problema" />
+                  <label htmlFor="support-category">Categoria do problema</label>
+                  <select id="support-category" name="category" value={supportCategory} onChange={(event) => { const category = supportCategories.find((candidate) => candidate === event.target.value); if (category) setSupportCategory(category); setPreparedSupportUrl(''); setSupportCenterNotice('') }}>
+                    {supportCategories.map((category) => <option key={category} value={category}>{category}</option>)}
+                  </select>
+                  <label htmlFor="support-description">Descrição detalhada</label>
+                  <textarea id="support-description" name="description" maxLength={3000} required value={supportDescription} onChange={(event) => { setSupportDescription(event.target.value); setPreparedSupportUrl(''); setSupportCenterNotice('') }} placeholder="Conta-nos o que aconteceu e os passos para reproduzir o problema." rows={5} />
+                  <label htmlFor="support-screenshot">Captura de ecrã (opcional)</label>
+                  <input id="support-screenshot" name="screenshot" type="file" accept="image/png,image/jpeg,image/webp" onChange={selectSupportScreenshot} />
+                  <span className="support-form-hint">
+                    {supportScreenshotName ? `Imagem selecionada: ${supportScreenshotName}. Anexa-a manualmente no WhatsApp depois de abrir a conversa.` : 'PNG, JPEG ou WebP, até 5 MB. A imagem não é enviada por esta página; podes anexá-la no WhatsApp.'}
+                  </span>
+                  <button className="button button-primary" type="submit">Preparar mensagem para WhatsApp <span aria-hidden="true">↗</span></button>
+                </form>
+                {supportCenterNotice && <p className="support-form-notice" role="status" aria-live="polite">{supportCenterNotice}</p>}
+                {preparedSupportUrl && <a className="support-prepared-link" href={preparedSupportUrl} target="_blank" rel="noreferrer">Abrir WhatsApp com mensagem preparada <span aria-hidden="true">↗</span></a>}
+              </section>
+
+              <section className="info-panel support-faq-panel">
+                <h2>Perguntas frequentes</h2>
+                <div className="support-faq-list">
+                  {supportFAQs.map((faq) => (
+                    <details className="support-faq-item" key={faq.question}>
+                      <summary>{faq.question}</summary>
+                      <p>{faq.answer}</p>
+                    </details>
+                  ))}
+                </div>
+              </section>
+            </div>
+          </section>
+        )}
+
+        {screen === 'support' && (
+          <section className="content-section support-section">
+            <div className="section-heading">
+              <span className="eyebrow">MAXAKA · APOIO VOLUNTÁRIO</span>
+              <h1>Apoiar o <span>MAXAKA</span></h1>
+              <p>O teu contributo ajuda a desenvolver o jogo, manter os servidores e criar novas funcionalidades. Apoiar é totalmente voluntário.</p>
+            </div>
+            <div className="support-methods">
+              {supportMethods.map((method) => (
+                <article className="info-panel support-card" key={method.id}>
+                  <div className="support-method-brand">
+                    <img className="support-method-logo" src={method.logo} alt="" />
+                    <span className="eyebrow">{method.name}</span>
+                  </div>
+                  <span className="support-detail">{method.detail}</span>
+                  <strong className="support-number">{method.number}</strong>
+                  <p className="support-holder">Titular: <strong>{method.holder}</strong></p>
+                  <button className="button button-secondary support-copy" type="button" onClick={() => void copySupportNumber(method.id, method.number)}>
+                    {copiedSupportMethod === method.id ? 'Copiado' : 'Copiar número'}
+                  </button>
+                </article>
+              ))}
+            </div>
+            <p className="support-notice" role="status" aria-live="polite">{supportNotice}</p>
+            <div className="info-panel support-instructions">
+              <h2>Como apoiar</h2>
+              <ol>
+                <li>Escolhe um dos métodos e copia o respetivo número.</li>
+                <li>Abre a aplicação eMola, M-Pesa ou Millennium BIM e inicia uma transferência ou envio de dinheiro.</li>
+                <li>Introduz o número ou conta, confirma o nome do titular apresentado pela aplicação e escolhe o valor que queres enviar.</li>
+                <li>Confirma a operação diretamente na aplicação do teu banco ou serviço de pagamentos.</li>
+              </ol>
+            </div>
+            <p className="support-thanks">Obrigado por ajudares o MAXAKA a crescer. Cada apoio faz diferença. <span aria-hidden="true">♥</span></p>
+          </section>
+        )}
       </div>
 
       {screen === 'home' && (
@@ -971,7 +1363,9 @@ function App() {
           <span>© 2026 MAXAKA <span className="footer-dot">●</span> JOGA À TUA MANEIRA</span>
           <nav aria-label="Navegação de rodapé">
             <button type="button" onClick={() => setScreen('help')}>Ajuda</button>
+            <button type="button" onClick={() => { setPreparedSupportUrl(''); setSupportCenterNotice(''); setSupportPhoneNotice(''); setScreen('helpdesk') }}>Suporte</button>
             <button type="button" onClick={() => setScreen('credits')}>Créditos</button>
+            <button type="button" onClick={() => { setSupportNotice(''); setCopiedSupportMethod(null); setScreen('support') }}>Apoiar o MAXAKA</button>
           </nav>
           <span className="footer-made">FEITO COM <b>♥</b> PARA JOGAR EM CONJUNTO</span>
         </footer>

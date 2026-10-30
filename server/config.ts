@@ -1,8 +1,41 @@
 import 'dotenv/config'
-import { isIP } from 'node:net'
 import { z } from 'zod'
 
-const isValidIp = (value: string) => isIP(value) !== 0
+export function parseAllowedOrigins(rawOrigins: string): string[] {
+  return [...new Set(rawOrigins
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+    .map((origin) => new URL(origin).origin))]
+}
+
+export function isAllowedOrigin(origin: string | undefined, allowedOrigins: string = config.CLIENT_ORIGIN): boolean {
+  if (!origin) return false
+  try {
+    const requestOrigin = new URL(origin).origin
+    const configuredOrigins = parseAllowedOrigins(allowedOrigins)
+    if (configuredOrigins.includes(requestOrigin)) return true
+
+    const requestHost = new URL(origin).hostname
+    const requestPort = new URL(origin).port
+    const requestProtocol = new URL(origin).protocol
+
+    return configuredOrigins.some((configuredOrigin) => {
+      const configuredUrl = new URL(configuredOrigin)
+      const configuredHost = configuredUrl.hostname
+      const configuredPort = configuredUrl.port
+      const configuredProtocol = configuredUrl.protocol
+
+      const sameLoopbackAlias = (requestHost === 'localhost' && (configuredHost === '127.0.0.1' || configuredHost === '::1'))
+        || ((requestHost === '127.0.0.1' || requestHost === '::1') && configuredHost === 'localhost')
+      return configuredProtocol === requestProtocol
+        && configuredPort === requestPort
+        && sameLoopbackAlias
+    })
+  } catch {
+    return false
+  }
+}
 
 const environmentSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(3001),
@@ -15,12 +48,8 @@ const environmentSchema = z.object({
   MYSQL_QUEUE_LIMIT: z.coerce.number().int().min(1).max(10000).default(100),
   REDIS_URL: z.string().default(''),
   INSTANCE_PUBLIC_URL: z.string().default(''),
-  CLIENT_ORIGIN: z.string().url().default('http://127.0.0.1:5173'),
+  CLIENT_ORIGIN: z.string().default('http://localhost:5173,http://127.0.0.1:5173'),
   HOST_RECONNECT_GRACE_MS: z.coerce.number().int().min(1000).max(300000).default(20000),
-  MEDIA_LISTEN_IP: z.string().refine(isValidIp, { message: 'Precisa de um endereço IP válido.' }).default('0.0.0.0'),
-  MEDIA_ANNOUNCED_ADDRESS: z.string().min(1).default('127.0.0.1'),
-  MEDIA_RTC_MIN_PORT: z.coerce.number().int().min(1024).max(65534).default(40000),
-  MEDIA_RTC_MAX_PORT: z.coerce.number().int().min(1025).max(65535).default(49999),
   MEDIA_TURN_URLS: z.string().default(''),
   MEDIA_TURN_SHARED_SECRET: z.string().default(''),
 })
@@ -40,10 +69,6 @@ if (config.REDIS_URL && !/^rediss?:\/\/.+$/u.test(config.REDIS_URL)) {
 
 if (config.REDIS_URL && !z.string().url().safeParse(config.INSTANCE_PUBLIC_URL).success) {
   throw new Error('INSTANCE_PUBLIC_URL tem de ser o endereço público desta instância quando Redis está configurado.')
-}
-
-if (config.MEDIA_RTC_MIN_PORT >= config.MEDIA_RTC_MAX_PORT) {
-  throw new Error('MEDIA_RTC_MAX_PORT tem de ser superior a MEDIA_RTC_MIN_PORT.')
 }
 
 if (config.MEDIA_TURN_URLS) {
