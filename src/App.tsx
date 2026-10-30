@@ -76,7 +76,6 @@ type Team = {
 const avatars = avatarOptions.map(({ emoji }) => emoji)
 const botNames = ['Paito', 'Ana', 'Maria', 'João', 'Marcos', 'José', 'Shelton', 'Sharmyla', 'Andressa', 'Winney', 'Sónia', 'Telma']
 const teamColors = ['orange', 'blue', 'green', 'purple', 'pink']
-const configuredRealtimeServer = import.meta.env.VITE_SERVER_URL?.trim() || undefined
 
 function HintSetting({
   enabled,
